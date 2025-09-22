@@ -12,3 +12,45 @@ PyRevit расширение **SplitLayers** добавляет инструме
 - удаление исходной стены после успешного разделения.
 
 Инструмент рассчитан на pyRevit (Python 3.11) и Revit 2022.
+
+## Настройка структуры расширения
+
+Чтобы pyRevit увидел кнопку **SplitLayers** на вкладке `LayerTools`, структура папок должна выглядеть так:
+
+```
+SplitLayers.extension/
+└── LayerTools.tab/
+    └── LayerTools.panel/
+        └── SplitLayers.pushbutton/
+            └── script.py
+```
+
+### Автоматическая настройка (рекомендуется)
+
+1. Откройте PowerShell и перейдите в корень репозитория `SplitLayers.extension`:
+   ```powershell
+   Set-Location "C:\Users\<имя>\PycharmProjects\PWALL\SplitLayers.extension"
+   ```
+2. Запустите скрипт, который аккуратно создаст вкладку и при необходимости перенесёт панель:
+   ```powershell
+   .\EnsureLayerToolsTab.ps1
+   ```
+   Скрипт можно запускать повторно. Если папки уже находятся на нужных местах, он просто сообщит об этом и не выдаст ошибок.
+
+### Ручная настройка (для понимания процесса)
+
+Если хотите выполнить действия вручную, проверьте существование папок с помощью `Test-Path`:
+
+```powershell
+if (-not (Test-Path "LayerTools.tab")) {
+    New-Item -ItemType Directory -Path "LayerTools.tab"
+}
+
+if (Test-Path "LayerTools.panel" -and -not (Test-Path "LayerTools.tab\\LayerTools.panel")) {
+    Move-Item -Path "LayerTools.panel" -Destination "LayerTools.tab"
+}
+```
+
+Такая конструкция не выдаст ошибок, даже если вкладка уже создана или панель уже перенесена.
+
+После изменения структуры перезагрузите pyRevit (или заново добавьте расширение) и убедитесь, что вкладка `LayerTools` появилась с панелью и кнопкой **SplitLayers**.
