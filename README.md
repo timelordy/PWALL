@@ -27,6 +27,7 @@ SplitLayers.extension/
 
 Каталог `SplitLayers.extension/Latest/SplitLayers.pushbutton` содержит "эталонный" набор файлов кнопки. Скрипт развёртывания всегда копирует именно его.
 
+
 ### Автоматическая настройка (рекомендуется)
 
 1. Откройте PowerShell и перейдите в корень репозитория `SplitLayers.extension`:
@@ -61,3 +62,4 @@ Copy-Item -Path "Latest\SplitLayers.pushbutton" -Destination "LayerTools.tab\Lay
 Такая последовательность безоговорочно сформирует правильную структуру и закинет актуальный скрипт. После этого перезагрузите pyRevit (или заново добавьте расширение) и убедитесь, что вкладка `LayerTools` появилась с панелью и кнопкой **SplitLayers**.
 
 Обновление скрипта теперь сводится к замене файлов в каталоге `Latest\SplitLayers.pushbutton` и повторному запуску `EnsureLayerToolsTab.ps1`.
+
