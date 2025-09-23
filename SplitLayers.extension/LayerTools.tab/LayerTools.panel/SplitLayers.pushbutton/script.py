@@ -106,6 +106,62 @@ def generate_default_type_name(base_name, material_name, thickness_mm, index):
     return u"{}_L{}_{}_{}мм".format(base, index + 1, material, thickness_value)
 
 
+def _vector_length(vector):
+    """Вычисление длины вектора XYZ."""
+    if vector is None:
+        return 0.0
+
+    try:
+        return math.sqrt(vector.X ** 2 + vector.Y ** 2 + vector.Z ** 2)
+    except Exception:
+        return 0.0
+
+
+def _normalize_vector(vector):
+    """Нормализация вектора. Возвращает None, если длина слишком мала."""
+    length = _vector_length(vector)
+    if length <= 1e-9:
+        return None
+
+    try:
+        return XYZ(vector.X / length, vector.Y / length, vector.Z / length)
+    except Exception:
+        return None
+
+
+def _scale_vector(vector, scalar):
+    """Масштабирование вектора на скаляр."""
+    if vector is None:
+        return None
+
+    try:
+        return XYZ(vector.X * scalar, vector.Y * scalar, vector.Z * scalar)
+    except Exception:
+        return None
+
+
+def _add_xyz(point, vector):
+    """Сложение точки и вектора."""
+    if point is None or vector is None:
+        return None
+
+    try:
+        return XYZ(point.X + vector.X, point.Y + vector.Y, point.Z + vector.Z)
+    except Exception:
+        return None
+
+
+def _subtract_xyz(point_a, point_b):
+    """Вычитание двух точек XYZ."""
+    if point_a is None or point_b is None:
+        return None
+
+    try:
+        return XYZ(point_a.X - point_b.X, point_a.Y - point_b.Y, point_a.Z - point_b.Z)
+    except Exception:
+        return None
+
+
 class LayerUIData(object):
     """Описание слоя для отображения в пользовательском интерфейсе."""
 
@@ -508,7 +564,8 @@ class WallLayerSeparator:
                     'width': layer_width,
                     'material_id': layer_material_id,
                     'material_name': material_name,
-                    'width_mm': round(layer_width * 304.8, 1)  # футы в мм
+                    'width_mm': round(layer_width * 304.8, 1),  # футы в мм
+                    'is_core': self.compound_structure.IsCoreLayer(i) if hasattr(self.compound_structure, 'IsCoreLayer') else False
                 })
         else:
             # Альтернативный метод для стен без CompoundStructure
@@ -532,7 +589,8 @@ class WallLayerSeparator:
                     'width': total_width,
                     'material_id': material_id,
                     'material_name': self.get_element_name(material, default="Основной материал"),
-                    'width_mm': round(total_width * 304.8, 1)
+                    'width_mm': round(total_width * 304.8, 1),
+                    'is_core': True
                 })
 
         return layers_info
@@ -638,47 +696,112 @@ class WallLayerSeparator:
         if not isinstance(location_curve, LocationCurve):
             raise Exception("Стена не имеет линии расположения")
 
-        wall_line = location_curve.Curve
+        wall_curve = location_curve.Curve
 
-        # Получаем вектор перпендикулярный стене
-        start_point = wall_line.GetEndPoint(0)
-        end_point = wall_line.GetEndPoint(1)
+        # Нормализованный вектор, направленный к внешней стороне стены
+        orientation_vector = _normalize_vector(getattr(self.original_wall, 'Orientation', None))
 
-        # Вектор вдоль стены
-        wall_vector = (end_point - start_point).Normalize()
+        if orientation_vector is None:
+            # Резервный путь: используем перпендикуляр, рассчитанный по координатам
+            try:
+                wall_line = wall_curve
+                start_point = wall_line.GetEndPoint(0)
+                end_point = wall_line.GetEndPoint(1)
+                direction = _normalize_vector(_subtract_xyz(end_point, start_point))
+            except Exception:
+                direction = None
 
-        # Перпендикулярный вектор (в плане XY)
-        perpendicular = XYZ(-wall_vector.Y, wall_vector.X, 0)
+            if direction is None:
+                raise Exception("Не удалось определить ориентацию стены")
 
-        # Определяем сторону ориентации стены
-        if self.original_wall.Flipped:
-            perpendicular = -perpendicular
+            orientation_vector = XYZ(-direction.Y, direction.X, 0)
+            if self.original_wall.Flipped:
+                orientation_vector = XYZ(-orientation_vector.X, -orientation_vector.Y, -orientation_vector.Z)
 
-        # Получаем общую толщину стены
-        total_width = sum([l['width'] for l in layers_info])
+            orientation_vector = _normalize_vector(orientation_vector)
 
-        # Рассчитываем смещения для каждого слоя
-        positions = []
-        current_offset = -total_width / 2.0  # Начинаем от внешней грани
+        if orientation_vector is None:
+            raise Exception("Не удалось определить направление внешней стороны стены")
+
+        total_width = sum([layer.get('width', 0.0) for layer in layers_info])
+
+        cumulative = 0.0
+        core_start = 0.0
+        core_end = total_width
+        first_core_found = False
 
         for layer in layers_info:
-            # Центр текущего слоя
-            layer_center_offset = current_offset + layer['width'] / 2.0
+            width = layer.get('width', 0.0)
+            layer['start_from_exterior'] = cumulative
+            layer['center_from_exterior'] = cumulative + width / 2.0
 
-            # Создаём линию для новой стены
-            offset_vector = perpendicular * layer_center_offset
-            new_start = start_point + offset_vector
-            new_end = end_point + offset_vector
+            if layer.get('is_core'):
+                if not first_core_found:
+                    core_start = cumulative
+                    first_core_found = True
+                core_end = cumulative + width
 
-            new_line = Line.CreateBound(new_start, new_end)
+            cumulative += width
+
+        if not first_core_found:
+            core_start = 0.0
+            core_end = total_width
+
+        location_reference = total_width / 2.0
+        try:
+            location_line = WallUtils.GetWallLocationLine(self.original_wall)
+        except Exception:
+            location_line = None
+
+        if location_line == WallLocationLine.FinishFaceExterior:
+            location_reference = 0.0
+        elif location_line == WallLocationLine.FinishFaceInterior:
+            location_reference = total_width
+        elif location_line == WallLocationLine.CoreExterior:
+            location_reference = core_start
+        elif location_line == WallLocationLine.CoreInterior:
+            location_reference = core_end
+        elif location_line == WallLocationLine.CoreCenterline:
+            location_reference = (core_start + core_end) / 2.0
+
+        positions = []
+
+        for layer in layers_info:
+            width = layer.get('width', 0.0)
+
+            if width <= 1e-6:
+                output.print_md(
+                    u"⚠️ Слой `{}` имеет нулевую толщину и будет пропущен.".format(
+                        layer.get('material_name', u"Слой {}".format(layer.get('index', 0) + 1))
+                    )
+                )
+                continue
+
+            center_from_exterior = layer.get('center_from_exterior', 0.0)
+            offset_from_location = location_reference - center_from_exterior
+
+            offset_vector = _scale_vector(orientation_vector, offset_from_location)
+            if offset_vector is None:
+                raise Exception("Не удалось вычислить смещение для слоя")
+
+            try:
+                if isinstance(wall_curve, Line):
+                    start_point = wall_curve.GetEndPoint(0)
+                    end_point = wall_curve.GetEndPoint(1)
+                    new_start = _add_xyz(start_point, offset_vector)
+                    new_end = _add_xyz(end_point, offset_vector)
+                    new_curve = Line.CreateBound(new_start, new_end)
+                else:
+                    new_curve = wall_curve.CreateOffset(offset_from_location, XYZ.BasisZ)
+            except Exception:
+                translation = Transform.CreateTranslation(offset_vector)
+                new_curve = wall_curve.CreateTransformed(translation)
 
             positions.append({
                 'layer': layer,
-                'curve': new_line,
-                'offset': layer_center_offset
+                'curve': new_curve,
+                'offset': offset_from_location
             })
-
-            current_offset += layer['width']
 
         return positions
 
@@ -797,6 +920,26 @@ class WallLayerSeparator:
 
         # 2. Получение информации о слоях
         layers_info = self.get_wall_info()
+
+        # Отбрасываем слои с нулевой толщиной, так как их невозможно превратить в отдельную стену
+        positive_layers = []
+        skipped_layers = []
+        for layer in layers_info:
+            if layer.get('width', 0.0) and layer['width'] > 1e-6:
+                positive_layers.append(layer)
+            else:
+                skipped_layers.append(layer)
+
+        if skipped_layers:
+            output.print_md("⚠️ Пропущены слои с нулевой толщиной:")
+            for layer in skipped_layers:
+                output.print_md("- {}".format(layer.get('material_name', u"Слой {}".format(layer.get('index', 0) + 1))))
+
+        layers_info = positive_layers
+
+        if not layers_info:
+            forms.alert(u"У выбранной стены отсутствуют слои с ненулевой толщиной.", exitscript=True)
+            return
 
         output.print_md("### Найдено слоёв: **{}**".format(len(layers_info)))
         for layer in layers_info:
