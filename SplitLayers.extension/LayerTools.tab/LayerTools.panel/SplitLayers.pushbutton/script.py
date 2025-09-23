@@ -254,6 +254,34 @@ class WallLayerSeparator:
 
         return layers_info
 
+    def get_creation_height(self):
+        """Получение высоты исходной стены для создания новых"""
+
+        # Пробуем получить «несвязанную» высоту стены
+        try:
+            height_param = self.original_wall.get_Parameter(
+                BuiltInParameter.WALL_USER_HEIGHT_PARAM
+            )
+            if height_param and height_param.HasValue:
+                height = height_param.AsDouble()
+                if height and height > 0:
+                    return height
+        except Exception:
+            pass
+
+        # Если параметр не дал результата — оцениваем высоту по габаритному контейнеру
+        try:
+            bbox = self.original_wall.get_BoundingBox(None)
+            if bbox:
+                height = bbox.Max.Z - bbox.Min.Z
+                if height and height > 0:
+                    return height
+        except Exception:
+            pass
+
+        # Последний вариант — используем стандартное значение 3000 мм
+        return UnitUtils.ConvertToInternalUnits(3000, UnitTypeId.Millimeters)
+
     def create_single_layer_wall_type(self, layer_info, base_name):
         """Создание нового типа стены с одним слоем"""
 
@@ -454,7 +482,7 @@ class WallLayerSeparator:
                     pos_data['curve'],
                     pos_data['layer']['new_type'].Id,
                     self.original_wall.LevelId,
-                    self.original_wall.Height,
+                    self.get_creation_height(),
                     0,  # offset
                     self.original_wall.Flipped,
                     False  # structural
