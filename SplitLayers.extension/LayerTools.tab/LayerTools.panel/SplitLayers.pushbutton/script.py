@@ -36,7 +36,6 @@ except Exception:
     except Exception:
         StackedWallUtils = None
 
-
 def _get_stacked_wall_utils():
     """Возвращает доступный класс StackedWallUtils или None без выброса NameError."""
 
@@ -44,7 +43,6 @@ def _get_stacked_wall_utils():
         return globals().get('StackedWallUtils')
     except Exception:
         return None
-
 # Импорт PyRevit
 from pyrevit import revit, DB, UI
 from pyrevit import forms
