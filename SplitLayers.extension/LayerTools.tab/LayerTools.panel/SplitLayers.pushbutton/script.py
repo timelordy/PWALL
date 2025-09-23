@@ -89,6 +89,8 @@ def get_element_name(element, default=u"Без имени"):
         return default
 
 
+_DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
+
 _LAYER_FUNCTION_MAP = {
     MaterialFunctionAssignment.Structure: u"Несущий слой",
     MaterialFunctionAssignment.Substrate: u"Основание",
@@ -96,8 +98,10 @@ _LAYER_FUNCTION_MAP = {
     MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
     MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
     MaterialFunctionAssignment.Membrane: u"Мембрана",
-    MaterialFunctionAssignment.Other: u"Прочий слой",
 }
+
+if _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
+    _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
 
 
 def describe_layer_function(layer_function):
@@ -191,7 +195,7 @@ class CompositeWallPartsPipeline(object):
             try:
                 function = structure.GetLayerFunction(index)
             except Exception:
-                function = MaterialFunctionAssignment.Other
+                function = _DEFAULT_LAYER_FUNCTION
 
             try:
                 material_id = structure.GetMaterialId(index)
