@@ -6,7 +6,7 @@ __author__ = 'Wall Layers Separator'
 
 import clr
 
-from System import MissingMemberException
+from System import Enum, MissingMemberException
 from System.Collections.Generic import List
 
 try:
@@ -80,6 +80,73 @@ for _param_name in (
     'PART_MATERIAL_NAME',
 ):
     _append_name_parameter(_param_name)
+
+
+def _try_get_enum_value(enum_type, name):
+    """Возвращает значение перечисления по имени, если оно существует."""
+
+    if not enum_type or not name:
+        return None
+
+    try:
+        return getattr(enum_type, name)
+    except (AttributeError, MissingMemberException):
+        pass
+    except Exception:
+        pass
+
+    try:
+        return Enum.Parse(enum_type, name)
+    except Exception:
+        return None
+
+
+def _get_enum_value(enum_type, preferred_names=(), keyword_sets=()):
+    """Пытается безопасно найти значение перечисления для разных версий Revit."""
+
+    for name in preferred_names:
+        value = _try_get_enum_value(enum_type, name)
+        if value is not None:
+            return value
+
+    try:
+        available_names = list(Enum.GetNames(enum_type))
+    except Exception:
+        available_names = []
+
+    if not available_names:
+        return None
+
+    normalized_names = [(unicode(name), unicode(name).lower()) for name in available_names]
+
+    for keywords in keyword_sets:
+        if not keywords:
+            continue
+
+        lowered_keywords = [unicode(keyword).lower() for keyword in keywords if keyword]
+        if not lowered_keywords:
+            continue
+
+        for name, lowered_name in normalized_names:
+            if all(keyword in lowered_name for keyword in lowered_keywords):
+                value = _try_get_enum_value(enum_type, name)
+                if value is not None:
+                    return value
+
+    return None
+
+
+_PARTS_VISIBILITY_SHOW_PARTS = _get_enum_value(
+    PartsVisibility,
+    preferred_names=('ShowParts', 'ShowPartsOnly'),
+    keyword_sets=(('show', 'parts'),),
+)
+
+_PARTS_VISIBILITY_SHOW_PARTS_AND_ORIGINAL = _get_enum_value(
+    PartsVisibility,
+    preferred_names=('ShowPartsAndOriginal', 'ShowOriginalAndParts', 'PartsAndOriginal'),
+    keyword_sets=(('show', 'parts', 'original'), ('parts', 'original')),
+)
 
 
 def get_element_name(element, default=u"Без имени"):
@@ -264,11 +331,46 @@ class CompositeWallPartsPipeline(object):
             )
             return False
 
-        if current_visibility in (PartsVisibility.ShowParts, PartsVisibility.ShowPartsAndOriginal):
+        allowed_visibility_values = tuple(
+            value
+            for value in (
+                _PARTS_VISIBILITY_SHOW_PARTS,
+                _PARTS_VISIBILITY_SHOW_PARTS_AND_ORIGINAL,
+            )
+            if value is not None
+        )
+
+        if allowed_visibility_values and current_visibility in allowed_visibility_values:
             return True
 
         try:
-            view.PartsVisibility = PartsVisibility.ShowParts
+            current_visibility_name = unicode(current_visibility)
+        except Exception:
+            current_visibility_name = u""
+
+        if not allowed_visibility_values:
+            if current_visibility_name and u"part" in current_visibility_name.lower():
+                return True
+
+            output.print_md(
+                u"⚠️ API Revit не сообщает доступные значения PartsVisibility."
+            )
+            output.print_md(
+                u"   Включите отображение частей вручную перед запуском скрипта."
+            )
+            return False
+
+        if _PARTS_VISIBILITY_SHOW_PARTS is None:
+            output.print_md(
+                u"⚠️ Не удалось получить значение режима 'Показывать части' из API."
+            )
+            output.print_md(
+                u"   Включите отображение Parts вручную и повторите попытку."
+            )
+            return False
+
+        try:
+            view.PartsVisibility = _PARTS_VISIBILITY_SHOW_PARTS
             output.print_md(
                 u"ℹ️ Активный вид переключён на режим отображения частей (Parts)."
             )
