@@ -27,6 +27,7 @@ from Autodesk.Revit.DB import (
     UnitUtils,
     Wall,
     WallType,
+    WallUtils,
 )
 from Autodesk.Revit.UI.Selection import ObjectType
 
@@ -301,6 +302,307 @@ def _get_layer_count(structure):
         return 0
 
 
+def _coerce_element_id_list(raw_ids):
+    """Преобразует коллекцию ElementId в список с защитой от ошибок."""
+
+    result = []
+
+    if raw_ids is None:
+        return result
+
+    try:
+        iterator = iter(raw_ids)
+    except TypeError:
+        iterator = None
+    except Exception:
+        iterator = None
+
+    if iterator is not None:
+        try:
+            for item in raw_ids:
+                if isinstance(item, ElementId):
+                    result.append(item)
+                else:
+                    try:
+                        result.append(ElementId(int(item)))
+                    except Exception:
+                        continue
+        except Exception:
+            result = []
+
+        return result
+
+    count = 0
+
+    try:
+        count = int(getattr(raw_ids, 'Count', 0))
+    except Exception:
+        count = 0
+
+    for index in range(count):
+        try:
+            item = raw_ids[index]
+        except Exception:
+            continue
+
+        if isinstance(item, ElementId):
+            result.append(item)
+        else:
+            try:
+                result.append(ElementId(int(item)))
+            except Exception:
+                continue
+
+    return result
+
+
+def _invoke_with_optional_bool(method):
+    """Безопасно вызывает метод без аргументов или с булевым аргументом."""
+
+    if not callable(method):
+        return None
+
+    try:
+        return method()
+    except TypeError:
+        pass
+    except Exception:
+        return None
+
+    for flag in (False, True):
+        try:
+            return method(flag)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
+def _get_wall_type_kind(wall_type):
+    """Пытается определить тип стены (Basic, Stacked и т.д.)."""
+
+    if not isinstance(wall_type, WallType):
+        return None
+
+    for accessor in ('Kind', 'get_Kind'):
+        try:
+            value = getattr(wall_type, accessor)
+        except (AttributeError, MissingMemberException):
+            value = None
+        except Exception:
+            value = None
+
+        if value is None:
+            continue
+
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def _is_stacked_wall_kind(kind):
+    """Определяет, относится ли стена к семейству "Составная" (Stacked)."""
+
+    if not kind:
+        return False
+
+    try:
+        kind_text = unicode(kind)
+    except Exception:
+        try:
+            kind_text = str(kind)
+        except Exception:
+            kind_text = u''
+
+    kind_text = kind_text.lower()
+    return 'stacked' in kind_text or u'состав' in kind_text
+
+
+def _get_stacked_wall_member_ids(wall, wall_type=None):
+    """Возвращает ElementId вложенных стен для составной стены."""
+
+    member_ids = []
+    seen_ids = set()
+
+    def _extend(result):
+        for element_id in _coerce_element_id_list(result):
+            try:
+                key = element_id.IntegerValue
+            except Exception:
+                key = None
+
+            if key is not None:
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+
+            member_ids.append(element_id)
+
+    candidates = []
+
+    if wall:
+        candidates.append(wall)
+
+    if wall_type and wall_type not in candidates:
+        candidates.append(wall_type)
+
+    try:
+        utils_method = getattr(WallUtils, 'GetStackedWallMemberIds')
+    except Exception:
+        utils_method = None
+
+    if callable(utils_method) and wall:
+        try:
+            _extend(utils_method(wall))
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        for accessor in (
+            'GetStackedWallMemberIds',
+            'get_StackedWallMemberIds',
+            'GetMemberIds',
+            'get_MemberIds',
+            'GetStackedWallMembers',
+            'get_StackedWallMembers',
+        ):
+            try:
+                method = getattr(candidate, accessor)
+            except (AttributeError, MissingMemberException):
+                method = None
+            except Exception:
+                method = None
+
+            if not callable(method):
+                continue
+
+            try:
+                result = _invoke_with_optional_bool(method)
+            except Exception:
+                result = None
+
+            if result is None:
+                continue
+
+            _extend(result)
+
+    return member_ids
+
+
+def _enumerate_structure_layers(structure):
+    """Возвращает пары (индекс, слой) для CompoundStructure."""
+
+    enumerated_layers = []
+
+    if not structure:
+        return enumerated_layers
+
+    try:
+        raw_layers = structure.GetLayers()
+    except (AttributeError, MissingMemberException):
+        raw_layers = None
+    except Exception:
+        raw_layers = None
+
+    if raw_layers is not None:
+        try:
+            for idx, layer_obj in enumerate(raw_layers):
+                enumerated_layers.append((idx, layer_obj))
+        except Exception:
+            enumerated_layers = []
+
+    if not enumerated_layers:
+        layer_count = _get_layer_count(structure)
+        for index in range(layer_count):
+            enumerated_layers.append((index, None))
+
+    return enumerated_layers
+
+
+def _structure_to_layer_info(structure, doc, index_offset=0):
+    """Преобразует CompoundStructure в список словарей со сведениями о слоях."""
+
+    layers = []
+
+    if not structure:
+        return layers
+
+    for index, layer_obj in _enumerate_structure_layers(structure):
+        width = None
+        function = None
+        material_id = None
+        is_core = False
+
+        if layer_obj is not None:
+            try:
+                width = layer_obj.Width
+            except Exception:
+                width = None
+
+            try:
+                function = layer_obj.Function
+            except Exception:
+                function = None
+
+            try:
+                material_id = layer_obj.MaterialId
+            except Exception:
+                material_id = None
+
+            try:
+                is_core = bool(layer_obj.IsCore)
+            except Exception:
+                is_core = False
+
+        if width is None:
+            try:
+                width = structure.GetLayerWidth(index)
+            except Exception:
+                width = 0.0
+
+        if function is None:
+            try:
+                function = structure.GetLayerFunction(index)
+            except Exception:
+                function = _DEFAULT_LAYER_FUNCTION
+
+        if material_id is None:
+            try:
+                material_id = structure.GetMaterialId(index)
+            except Exception:
+                material_id = ElementId.InvalidElementId
+
+        if not is_core:
+            try:
+                is_core = structure.IsCoreLayer(index)
+            except Exception:
+                is_core = False
+
+        material = doc.GetElement(material_id) if material_id else None
+
+        layers.append({
+            'index': index_offset + index + 1,
+            'raw_index': index,
+            'width': width,
+            'width_mm': convert_to_mm(width),
+            'material_id': material_id,
+            'material_name': get_element_name(material, default=u"Без материала"),
+            'function': function,
+            'is_core': bool(is_core),
+        })
+
+    return layers
+
+
 class CompositeWallPartsPipeline(object):
     """Реализует пайплайн: подготовка вида → создание Parts → отчёт."""
 
@@ -312,6 +614,9 @@ class CompositeWallPartsPipeline(object):
         self.wall_type = None
         self.compound_structure = None
         self.layer_count = 0
+        self.wall_kind = None
+        self.uses_stacked_members = False
+        self.stacked_member_ids = []
 
     # ---------------------------- служебные методы ----------------------------
     def _ensure_view_ready(self):
@@ -408,106 +713,84 @@ class CompositeWallPartsPipeline(object):
 
     def _collect_layers(self):
         """Формирует подробности о слоях из CompoundStructure."""
-        layers = []
         structure = self.compound_structure
 
-        if not structure:
-            return layers
+        layers = _structure_to_layer_info(structure, self.doc, index_offset=0)
 
-        enumerated_layers = []
-
-        try:
-            raw_layers = structure.GetLayers()
-        except (AttributeError, MissingMemberException):
-            raw_layers = None
-        except Exception:
-            raw_layers = None
-
-        if raw_layers is not None:
-            try:
-                iterator = iter(raw_layers)
-            except TypeError:
-                iterator = None
-            except Exception:
-                iterator = None
-
-            if iterator is not None:
-                try:
-                    for idx, layer_obj in enumerate(raw_layers):
-                        enumerated_layers.append((idx, layer_obj))
-                except Exception:
-                    enumerated_layers = []
-
-        if not enumerated_layers:
-            layer_count = _get_layer_count(structure)
-            for index in range(layer_count):
-                enumerated_layers.append((index, None))
-
-        for index, layer_obj in enumerated_layers:
-            width = None
-            function = None
-            material_id = None
-            is_core = False
-
-            if layer_obj is not None:
-                try:
-                    width = layer_obj.Width
-                except Exception:
-                    width = None
-
-                try:
-                    function = layer_obj.Function
-                except Exception:
-                    function = None
-
-                try:
-                    material_id = layer_obj.MaterialId
-                except Exception:
-                    material_id = None
-
-                try:
-                    is_core = bool(layer_obj.IsCore)
-                except Exception:
-                    is_core = False
-
-            if width is None:
-                try:
-                    width = structure.GetLayerWidth(index)
-                except Exception:
-                    width = 0.0
-
-            if function is None:
-                try:
-                    function = structure.GetLayerFunction(index)
-                except Exception:
-                    function = _DEFAULT_LAYER_FUNCTION
-
-            if material_id is None:
-                try:
-                    material_id = structure.GetMaterialId(index)
-                except Exception:
-                    material_id = ElementId.InvalidElementId
-
-            if not is_core:
-                try:
-                    is_core = structure.IsCoreLayer(index)
-                except Exception:
-                    is_core = False
-
-            material = self.doc.GetElement(material_id) if material_id else None
-
-            layers.append({
-                'index': index + 1,
-                'raw_index': index,
-                'width': width,
-                'width_mm': convert_to_mm(width),
-                'material_id': material_id,
-                'material_name': get_element_name(material, default=u"Без материала"),
-                'function': function,
-                'is_core': bool(is_core),
-            })
+        if not layers and self.stacked_member_ids:
+            layers = self._collect_layers_from_stacked()
 
         self.layer_count = max(self.layer_count, len(layers))
+
+        return layers
+
+    def _collect_layers_from_stacked(self):
+        """Формирует подробности о слоях для составной (stacked) стены."""
+
+        member_ids = list(self.stacked_member_ids or [])
+
+        if not member_ids:
+            member_ids = _get_stacked_wall_member_ids(self.wall, self.wall_type)
+            self.stacked_member_ids = member_ids
+
+        if not member_ids:
+            return []
+
+        layers = []
+        index_offset = 0
+        doc = self.doc
+
+        for segment_index, member_id in enumerate(member_ids, 1):
+            try:
+                member_element = doc.GetElement(member_id)
+            except Exception:
+                member_element = None
+
+            member_wall = member_element if isinstance(member_element, Wall) else None
+            member_type = None
+
+            if isinstance(member_wall, Wall):
+                try:
+                    candidate_type = member_wall.WallType
+                except (AttributeError, MissingMemberException):
+                    candidate_type = None
+                except Exception:
+                    candidate_type = None
+
+                if isinstance(candidate_type, WallType):
+                    member_type = candidate_type
+
+            if not isinstance(member_type, WallType):
+                if isinstance(member_element, WallType):
+                    member_type = member_element
+                else:
+                    try:
+                        candidate_type = doc.GetElement(member_id)
+                    except Exception:
+                        candidate_type = None
+
+                    if isinstance(candidate_type, WallType):
+                        member_type = candidate_type
+
+            if not isinstance(member_type, WallType):
+                continue
+
+            structure = _resolve_compound_structure(member_type)
+            member_layers = _structure_to_layer_info(structure, doc, index_offset=index_offset)
+
+            if not member_layers:
+                continue
+
+            segment_name = get_element_name(member_type, default=u"Сегмент стены")
+            segment_offset = index_offset
+
+            for layer in member_layers:
+                layer['segment_index'] = segment_index
+                layer['segment_name'] = segment_name
+                layer['segment_layer_index'] = layer['index'] - segment_offset
+
+            layers.extend(member_layers)
+            index_offset += len(member_layers)
 
         return layers
 
@@ -520,8 +803,24 @@ class CompositeWallPartsPipeline(object):
         output.print_md(u"### Слои составной стены:")
         for layer in layers:
             badge = u" (сердцевина)" if layer.get('is_core') else u""
+            segment_info = u""
+
+            segment_index = layer.get('segment_index')
+            if segment_index:
+                segment_parts = [u"сегмент {}".format(segment_index)]
+
+                segment_layer_index = layer.get('segment_layer_index')
+                if segment_layer_index:
+                    segment_parts.append(u"слой {}".format(segment_layer_index))
+
+                segment_name = layer.get('segment_name')
+                if segment_name:
+                    segment_parts.append(segment_name)
+
+                segment_info = u" [{}]".format(u", ".join(segment_parts))
+
             output.print_md(
-                u"- Слой {idx}: **{mat}** — {width} мм, {func}{badge}".format(
+                u"- Слой {idx}: **{mat}** — {width} мм, {func}{badge}{segment_info}".format(
                     idx=layer['index'],
                     mat=layer['material_name'],
                     width=layer['width_mm'],
@@ -542,8 +841,24 @@ class CompositeWallPartsPipeline(object):
             for layer, part_id in zip(layers, part_ids):
                 part = self.doc.GetElement(part_id)
                 part_name = get_element_name(part, default=u"Часть")
+                segment_info = u""
+
+                segment_index = layer.get('segment_index')
+                if segment_index:
+                    segment_parts = [u"сегмент {}".format(segment_index)]
+
+                    segment_layer_index = layer.get('segment_layer_index')
+                    if segment_layer_index:
+                        segment_parts.append(u"слой {}".format(segment_layer_index))
+
+                    segment_name = layer.get('segment_name')
+                    if segment_name:
+                        segment_parts.append(segment_name)
+
+                    segment_info = u" [{}]".format(u", ".join(segment_parts))
+
                 output.print_md(
-                    u"- Слой {idx} → часть `{name}` (ID {pid}, {width} мм)".format(
+                    u"- Слой {idx}{segment_info} → часть `{name}` (ID {pid}, {width} мм)".format(
                         idx=layer['index'],
                         name=part_name,
                         pid=part_id.IntegerValue,
@@ -607,13 +922,18 @@ class CompositeWallPartsPipeline(object):
             if isinstance(type_element, WallType):
                 self.wall_type = type_element
 
+        self.wall_kind = _get_wall_type_kind(self.wall_type)
         self.compound_structure = _resolve_compound_structure(wall)
         self.layer_count = _get_layer_count(self.compound_structure)
+        self.stacked_member_ids = _get_stacked_wall_member_ids(self.wall, self.wall_type)
+        self.uses_stacked_members = bool(self.stacked_member_ids) and (
+            self.layer_count < 1 or _is_stacked_wall_kind(self.wall_kind)
+        )
 
-        if self.layer_count < 1:
+        if self.layer_count < 1 and not self.stacked_member_ids:
             forms.alert(
                 u"Стена не имеет многослойной структуры. Штатные Parts для неё создать нельзя.\n"
-                u"Получено количество слоёв: {}. Убедитесь, что выбран тип Basic Wall и у него заданы слои.".format(
+                u"Получено количество слоёв: {}. Убедитесь, что выбран тип стены со структурой слоёв или разложите сложные стены на составные сегменты.".format(
                     self.layer_count
                 ),
                 exitscript=True
@@ -652,6 +972,13 @@ class CompositeWallPartsPipeline(object):
 
         wall_name = get_element_name(self.wall_type, default=u"Стена")
         output.print_md(u"## Разбивка стены **{}** на Parts".format(wall_name))
+
+        if self.uses_stacked_members and self.stacked_member_ids:
+            output.print_md(
+                u"ℹ️ Обнаружена составная стена (Stacked). Будут обработаны {} сегментов.".format(
+                    len(self.stacked_member_ids)
+                )
+            )
 
         layers = self._collect_layers()
         output.print_md(
