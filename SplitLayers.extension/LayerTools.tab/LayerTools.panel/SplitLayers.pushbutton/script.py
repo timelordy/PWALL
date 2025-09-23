@@ -31,6 +31,132 @@ uidoc = revit.uidoc
 output = script.get_output()
 
 
+def sanitize_name(name):
+    """Удаление недопустимых символов и лишних пробелов из имени."""
+    if not name:
+        return ""
+
+    invalid_chars = '<>:"/\\|?*'
+    cleaned = []
+    for char in name:
+        if char in invalid_chars:
+            cleaned.append('-')
+        else:
+            cleaned.append(char)
+
+    normalized = "".join(cleaned)
+    normalized = normalized.replace('\n', ' ').replace('\r', ' ')
+    normalized = " ".join(normalized.split())
+    return normalized.strip()
+
+
+def generate_default_type_name(base_name, material_name, thickness_mm, index):
+    """Формирование наглядного и уникального имени типа стены."""
+    base = sanitize_name(base_name) or u"Стена"
+    material = sanitize_name(material_name) or u"Слой {}".format(index + 1)
+    thickness_value = int(round(thickness_mm or 0))
+    return u"{}_L{}_{}_{}мм".format(base, index + 1, material, thickness_value)
+
+
+class LayerUIData(object):
+    """Описание слоя для отображения в пользовательском интерфейсе."""
+
+    def __init__(self, layer_info, default_name):
+        self.layer_info = layer_info
+        self.MaterialName = layer_info.get('material_name') or u"Слой {}".format(layer_info.get('index', 0) + 1)
+        self.ThicknessDisplay = u"{:.1f} мм".format(layer_info.get('width_mm', 0.0))
+        self.ReplacementName = default_name
+        self.DefaultName = default_name
+        self.Selected = True
+
+    @property
+    def display_label(self):
+        return u"{} ({:.1f} мм)".format(self.MaterialName, self.layer_info.get('width_mm', 0.0))
+
+
+class LayerSelectionWindow(forms.WPFWindow):
+    """Окно выбора слоёв и задания имён новых типов стен."""
+
+    def __init__(self, layers_info, base_name):
+        xaml_path = script.get_bundle_file('LayerSelection.xaml')
+        forms.WPFWindow.__init__(self, xaml_path)
+
+        self.layers_info = layers_info
+        self.base_name = base_name
+        self.layer_items = []
+        self._selected_items = []
+
+        self._build_layers()
+
+    def _build_layers(self):
+        """Создание элементов интерфейса для списка слоёв."""
+        from System.Windows.Controls import CheckBox
+        from System.Windows import Thickness
+
+        for idx, layer in enumerate(self.layers_info):
+            default_name = generate_default_type_name(
+                self.base_name,
+                layer.get('material_name'),
+                layer.get('width_mm'),
+                layer.get('index', idx)
+            )
+
+            item = LayerUIData(layer, default_name)
+            self.layer_items.append(item)
+
+            checkbox = CheckBox()
+            checkbox.Content = item.display_label
+            checkbox.IsChecked = True
+            checkbox.Tag = item
+            checkbox.Margin = Thickness(0, 0, 0, 6)
+            checkbox.Checked += self._checkbox_changed
+            checkbox.Unchecked += self._checkbox_changed
+            self.LayersPanel.Children.Add(checkbox)
+
+        self._refresh_grid()
+
+    def _checkbox_changed(self, sender, args):
+        item = getattr(sender, 'Tag', None)
+        if item:
+            item.Selected = bool(sender.IsChecked)
+        self._refresh_grid()
+
+    def _refresh_grid(self):
+        selected = [item for item in self.layer_items if item.Selected]
+        self.LayerGrid.ItemsSource = selected
+        self.LayerGrid.Items.Refresh()
+
+    def ok_click(self, sender, args):
+        selected = [item for item in self.layer_items if item.Selected]
+        if not selected:
+            forms.alert(u"Выберите хотя бы один слой для разбивки.")
+            return
+
+        self._selected_items = selected
+        self.DialogResult = True
+        self.Close()
+
+    def cancel_click(self, sender, args):
+        self.DialogResult = False
+        self.Close()
+
+    def get_selected_layers(self):
+        """Возвращает список выбранных слоёв с пользовательскими именами."""
+        results = []
+        for item in getattr(self, '_selected_items', []):
+            layer_copy = dict(item.layer_info)
+            custom_name = sanitize_name(item.ReplacementName) or item.DefaultName
+            if not custom_name:
+                custom_name = generate_default_type_name(
+                    self.base_name,
+                    layer_copy.get('material_name'),
+                    layer_copy.get('width_mm'),
+                    layer_copy.get('index', 0)
+                )
+            layer_copy['custom_type_name'] = custom_name
+            results.append(layer_copy)
+        return results
+
 class WallLayerSeparator:
     def __init__(self):
         self.doc = doc
@@ -286,12 +412,23 @@ class WallLayerSeparator:
     def create_single_layer_wall_type(self, layer_info, base_name):
         """Создание нового типа стены с одним слоем"""
 
-        # Генерируем уникальное имя
-        new_name = "{}_{}_{}мм".format(
-            base_name,
-            layer_info['material_name'][:20],  # Ограничиваем длину
-            int(layer_info['width_mm'])
-        )
+        desired_name = layer_info.get('custom_type_name')
+        if desired_name:
+            new_name = sanitize_name(desired_name)
+        else:
+            new_name = ""
+
+        if not new_name:
+            new_name = generate_default_type_name(
+                base_name,
+                layer_info.get('material_name'),
+                layer_info.get('width_mm'),
+                layer_info.get('index', 0)
+            )
+
+        # Ограничиваем длину имени, чтобы избежать ошибок API
+        if len(new_name) > 60:
+            new_name = new_name[:60]
 
         # Проверяем, существует ли уже такой тип
         existing = None
@@ -455,6 +592,34 @@ class WallLayerSeparator:
             except:
                 continue
 
+    def show_layer_selection_dialog(self, layers_info, base_name):
+        """Отображение окна выбора слоёв и возврат выбранных данных."""
+
+        try:
+            window = LayerSelectionWindow(layers_info, base_name)
+            dialog_result = window.ShowDialog()
+        except Exception as e:
+            output.print_md(
+                u"⚠️ Не удалось отобразить окно выбора слоёв. Используются все слои.\nПричина: {}".format(e)
+            )
+            return layers_info
+
+        if dialog_result is None:
+            return None
+
+        try:
+            user_confirmed = bool(dialog_result)
+        except Exception:
+            user_confirmed = False
+
+        if user_confirmed:
+            selected = window.get_selected_layers()
+            if selected:
+                return selected
+            return None
+
+        return None
+
     def execute(self):
         """Основной метод выполнения"""
 
@@ -462,7 +627,8 @@ class WallLayerSeparator:
         if not self.select_wall():
             return
 
-        output.print_md("## Разбивка стены: **{}**".format(self.get_element_name(self.wall_type)))
+        wall_type_name = self.get_element_name(self.wall_type)
+        output.print_md("## Разбивка стены: **{}**".format(wall_type_name))
 
         # 2. Получение информации о слоях
         layers_info = self.get_wall_info()
@@ -474,7 +640,32 @@ class WallLayerSeparator:
                 layer['width_mm']
             ))
 
-        # 3. Получение вложенных элементов
+        base_name = sanitize_name(wall_type_name) or "Стена"
+
+        # 3. Открытие окна выбора слоёв
+        selected_layers = self.show_layer_selection_dialog(layers_info, base_name)
+        if selected_layers is None:
+            output.print_md("⚠️ Разбивка отменена пользователем.")
+            return
+
+        layers_info = selected_layers
+
+        output.print_md("### К обработке выбрано слоёв: **{}**".format(len(layers_info)))
+        for layer in layers_info:
+            custom_name = layer.get('custom_type_name')
+            if not custom_name:
+                custom_name = generate_default_type_name(
+                    base_name,
+                    layer.get('material_name'),
+                    layer.get('width_mm'),
+                    layer.get('index', 0)
+                )
+            output.print_md("- **{}** → новый тип: `{}`".format(
+                layer['material_name'],
+                custom_name
+            ))
+
+        # 4. Получение вложенных элементов
         self.hosted_elements = self.get_hosted_elements()
         if self.hosted_elements:
             output.print_md("### Найдено вложенных элементов: **{}**".format(
@@ -488,24 +679,22 @@ class WallLayerSeparator:
         ):
             return
 
-        # 4. Начинаем транзакцию
+        # 5. Начинаем транзакцию
         with revit.Transaction("Разбивка стены на слои"):
 
-            # 5. Создаём новые типы стен
+            # 6. Создаём новые типы стен
             output.print_md("### Создание новых типов стен...")
             new_wall_types = []
-            wall_type_name = self.get_element_name(self.wall_type)
-            base_name = wall_type_name.split('_')[0] if wall_type_name else "Стена"
 
             for layer in layers_info:
                 new_type = self.create_single_layer_wall_type(layer, base_name)
                 new_wall_types.append(new_type)
                 layer['new_type'] = new_type
 
-            # 6. Рассчитываем позиции новых стен
+            # 7. Рассчитываем позиции новых стен
             positions = self.calculate_wall_positions(layers_info)
 
-            # 7. Создаём новые стены
+            # 8. Создаём новые стены
             output.print_md("### Создание новых стен...")
             for pos_data in positions:
                 new_wall = Wall.Create(
@@ -528,13 +717,31 @@ class WallLayerSeparator:
                     self.get_element_name(pos_data['layer']['new_type'])
                 ))
 
-            # 8. Переносим вложенные элементы на ближайшую новую стену
+            # 9. Переносим вложенные элементы на ближайшую новую стену
             if self.hosted_elements and self.new_walls:
                 output.print_md("### Перенос вложенных элементов...")
 
+                def _wall_width(target_wall):
+                    try:
+                        structure = target_wall.WallType.GetCompoundStructure()
+                        if structure and structure.LayerCount:
+                            return structure.GetLayerWidth(0)
+                    except Exception:
+                        pass
+
+                    try:
+                        width_param = target_wall.WallType.get_Parameter(
+                            BuiltInParameter.WALL_ATTR_WIDTH_PARAM
+                        )
+                        if width_param and width_param.HasValue:
+                            return width_param.AsDouble()
+                    except Exception:
+                        pass
+
+                    return 0
+
                 # Находим стену с максимальной толщиной (обычно несущая)
-                main_wall = max(self.new_walls,
-                                key=lambda w: w.WallType.GetCompoundStructure().GetLayerWidth(0))
+                main_wall = max(self.new_walls, key=_wall_width)
 
                 for element in self.hosted_elements:
                     try:
@@ -545,7 +752,7 @@ class WallLayerSeparator:
                     except Exception as e:
                         output.print_md("✗ Ошибка переноса: {}".format(str(e)))
 
-            # 9. Соединяем новые стены между собой
+            # 10. Соединяем новые стены между собой
             output.print_md("### Соединение стен...")
             for i, wall1 in enumerate(self.new_walls):
                 for wall2 in self.new_walls[i + 1:]:
@@ -554,7 +761,7 @@ class WallLayerSeparator:
                     except:
                         pass  # Игнорируем ошибки соединения
 
-            # 10. Удаляем исходную стену
+            # 11. Удаляем исходную стену
             doc.Delete(self.original_wall.Id)
             output.print_md("### ✓ Исходная стена удалена")
 
