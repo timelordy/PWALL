@@ -56,6 +56,32 @@ def convert_to_mm(value):
             return 0.0
 
 
+_NAME_PARAMETER_CANDIDATES = []
+
+
+def _append_name_parameter(param_name):
+    """Пытается добавить BuiltInParameter по имени, если он существует."""
+
+    try:
+        param = getattr(BuiltInParameter, param_name)
+    except (AttributeError, MissingMemberException):
+        param = None
+    except Exception:
+        param = None
+
+    if param is not None:
+        _NAME_PARAMETER_CANDIDATES.append(param)
+
+
+for _param_name in (
+    'ALL_MODEL_TYPE_NAME',
+    'SYMBOL_NAME_PARAM',
+    'ELEM_FAMILY_AND_TYPE_PARAM',
+    'PART_MATERIAL_NAME',
+):
+    _append_name_parameter(_param_name)
+
+
 def get_element_name(element, default=u"Без имени"):
     """Безопасно получает имя элемента Revit."""
     if not element:
@@ -68,12 +94,7 @@ def get_element_name(element, default=u"Без имени"):
     except (AttributeError, MissingMemberException):
         pass
 
-    for param_id in (
-        BuiltInParameter.ALL_MODEL_TYPE_NAME,
-        BuiltInParameter.SYMBOL_NAME_PARAM,
-        BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM,
-        BuiltInParameter.PART_MATERIAL_NAME,
-    ):
+    for param_id in _NAME_PARAMETER_CANDIDATES:
         try:
             param = element.get_Parameter(param_id)
             if param and param.HasValue:
