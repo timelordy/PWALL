@@ -8,7 +8,6 @@ __title__ = 'Разбить\nСтену'
 __author__ = 'Wall Layers Separator'
 
 import clr
-import sys
 import math
 from System import MissingMemberException
 
@@ -21,28 +20,54 @@ from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.DB.Structure import *
 
 # В разных версиях Revit класс StackedWallUtils может находиться в разных
-# пространствах имён или отсутствовать вовсе. Выполняем безопасное
-# определение переменной, чтобы использовать класс, когда он доступен, и
+# пространствах имён или отсутствовать вовсе. Далее объявляется вспомогательная
+# переменная и функция поиска, чтобы использовать класс, когда он доступен, и
 # корректно обрабатывать случаи, когда API не предоставляет данный класс.
 StackedWallUtils = None
 
-try:
-    from Autodesk.Revit.DB import StackedWallUtils as _StackedWallUtils
-    StackedWallUtils = _StackedWallUtils
-except Exception:
-    try:
-        from Autodesk.Revit.DB.Structure import StackedWallUtils as _StackedWallUtils
-        StackedWallUtils = _StackedWallUtils
-    except Exception:
-        StackedWallUtils = None
 
 def _get_stacked_wall_utils():
     """Возвращает доступный класс StackedWallUtils или None без выброса NameError."""
 
+    global StackedWallUtils
+
+    # Если ранее уже удавалось определить класс, просто возвращаем его.
+    if StackedWallUtils:
+        return StackedWallUtils
+
+    candidate_namespaces = []
+
+    # Пытаемся получить класс из пространств имён, предоставляемых pyRevit.
+    candidate_namespaces.append(globals().get('DB'))
+
     try:
-        return globals().get('StackedWallUtils')
+        candidate_namespaces.append(getattr(globals().get('DB'), 'Structure', None))
     except Exception:
-        return None
+        candidate_namespaces.append(None)
+
+    # Собираем пространства имён, импортируя их напрямую при необходимости.
+    for module_name in ('Autodesk.Revit.DB', 'Autodesk.Revit.DB.Structure'):
+        try:
+            module = __import__(module_name, fromlist=['StackedWallUtils'])
+            candidate_namespaces.append(module)
+        except Exception:
+            candidate_namespaces.append(None)
+
+    # Перебираем возможные пространства имён и пытаемся получить класс.
+    for namespace in candidate_namespaces:
+        if not namespace:
+            continue
+
+        try:
+            candidate = getattr(namespace, 'StackedWallUtils', None)
+        except Exception:
+            candidate = None
+
+        if candidate:
+            StackedWallUtils = candidate
+            return StackedWallUtils
+
+    return None
 # Импорт PyRevit
 from pyrevit import revit, DB, UI
 from pyrevit import forms
@@ -197,6 +222,8 @@ class WallLayerSeparator:
     def _initialize_stacked_wall_data(self):
         """Попытка получить структуру слоёв из сегментов составной стены."""
 
+        global StackedWallUtils
+
         self.stacked_member_types = []
 
         stacked_utils = _get_stacked_wall_utils()
@@ -209,6 +236,12 @@ class WallLayerSeparator:
 
         try:
             member_ids = stacked_utils.GetMemberIds(self.original_wall)
+        except NameError:
+            StackedWallUtils = None
+            output.print_md(
+                u"⚠️ Класс `StackedWallUtils` недоступен в текущей версии Revit API."
+            )
+            return
         except Exception as e:
             output.print_md(
                 u"⚠️ Не удалось получить сегменты составной стены: {}".format(e)
