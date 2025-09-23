@@ -23,6 +23,36 @@ __title__ = "Разделить стену по слоям"
 __author__ = "pw-team"
 
 
+try:
+    _MILLIMETER_UNIT = DB.UnitTypeId.Millimeters
+
+    def _to_internal_mm(value):
+        return DB.UnitUtils.ConvertToInternalUnits(value, _MILLIMETER_UNIT)
+
+    def _from_internal_mm(value):
+        return DB.UnitUtils.ConvertFromInternalUnits(value, _MILLIMETER_UNIT)
+
+except AttributeError:
+    _MILLIMETER_UNIT = DB.DisplayUnitType.DUT_MILLIMETERS
+    _INTERNAL_LENGTH_UNIT = getattr(DB.DisplayUnitType, "DUT_DECIMAL_FEET", None)
+
+    def _to_internal_mm(value):
+        convert = getattr(DB.UnitUtils, "ConvertToInternalUnits", None)
+        if convert:
+            return convert(value, _MILLIMETER_UNIT)
+        if _INTERNAL_LENGTH_UNIT is not None:
+            return DB.UnitUtils.Convert(value, _MILLIMETER_UNIT, _INTERNAL_LENGTH_UNIT)
+        raise AttributeError("Не удалось определить единицы измерения для футов")
+
+    def _from_internal_mm(value):
+        convert = getattr(DB.UnitUtils, "ConvertFromInternalUnits", None)
+        if convert:
+            return convert(value, _MILLIMETER_UNIT)
+        if _INTERNAL_LENGTH_UNIT is not None:
+            return DB.UnitUtils.Convert(value, _INTERNAL_LENGTH_UNIT, _MILLIMETER_UNIT)
+        raise AttributeError("Не удалось определить единицы измерения для футов")
+
+
 class LayerInfo(object):
     """Информация об одном слое составной стены."""
 
@@ -50,9 +80,7 @@ class LayerInfo(object):
 
     @property
     def width_mm(self):
-        return DB.UnitUtils.ConvertFromInternalUnits(
-            self.width, DB.UnitTypeId.Millimeters
-        )
+        return _from_internal_mm(self.width)
 
     @property
     def display_name(self):
@@ -169,7 +197,7 @@ def _wall_type_thickness(wall_type):
 
 
 def _ask_mapping(layers, wall_types):
-    tolerance = DB.UnitUtils.ConvertToInternalUnits(1.0, DB.UnitTypeId.Millimeters)
+    tolerance = _to_internal_mm(1.0)
 
     components = []
     mapping_keys = []
@@ -180,7 +208,7 @@ def _ask_mapping(layers, wall_types):
             if math.fabs(thickness - layer.width) <= tolerance:
                 item_text = "{} ({:.1f} мм)".format(
                     wt.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM).AsString(),
-                    DB.UnitUtils.ConvertFromInternalUnits(thickness, DB.UnitTypeId.Millimeters),
+                    _from_internal_mm(thickness),
                 )
                 options.append(TemplateListItem(item_text, wt.Id))
         label = forms.Label("{}".format(layer.display_name))
