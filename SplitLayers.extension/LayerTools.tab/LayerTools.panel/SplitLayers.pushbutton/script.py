@@ -40,6 +40,42 @@ class WallLayerSeparator:
         self.new_walls = []
         self.hosted_elements = []
 
+    def get_element_name(self, element):
+        """Безопасное получение имени элемента Revit"""
+        if not element:
+            return "Без имени"
+
+        # Сначала пытаемся получить свойство Name напрямую
+        try:
+            name = element.Name
+            if name:
+                return name
+        except AttributeError:
+            pass
+
+        # Если свойства нет, пробуем получить значение из параметров
+        param_ids = [
+            BuiltInParameter.ALL_MODEL_TYPE_NAME,
+            BuiltInParameter.SYMBOL_NAME_PARAM,
+            BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM
+        ]
+
+        for param_id in param_ids:
+            try:
+                param = element.get_Parameter(param_id)
+                if param and param.HasValue:
+                    name = param.AsString()
+                    if name:
+                        return name
+            except Exception:
+                continue
+
+        # В крайнем случае возвращаем идентификатор элемента
+        try:
+            return "ID {}".format(element.Id.IntegerValue)
+        except Exception:
+            return "Без имени"
+
     def select_wall(self):
         """Выбор стены пользователем"""
         try:
@@ -99,7 +135,7 @@ class WallLayerSeparator:
 
                                 # Проверяем, действительно ли это однослойная стена
                                 output.print_md("⚠️ Обнаружена базовая стена без составной структуры")
-                                output.print_md("Тип: {}".format(self.wall_type.Name))
+                                output.print_md("Тип: {}".format(self.get_element_name(self.wall_type)))
                                 output.print_md("Толщина: {} мм".format(round(width * 304.8, 1)))
 
                                 forms.alert("Это базовая однослойная стена!\nИспользуйте для многослойных стен.",
@@ -134,7 +170,7 @@ class WallLayerSeparator:
             if not self.compound_structure:
                 # Выводим отладочную информацию
                 output.print_md("### Отладочная информация:")
-                output.print_md("- Имя типа: **{}**".format(self.wall_type.Name))
+                output.print_md("- Имя типа: **{}**".format(self.get_element_name(self.wall_type)))
                 output.print_md("- ID типа: **{}**".format(self.wall_type.Id))
                 output.print_md("- Тип стены (Kind): **{}**".format(self.wall_type.Kind))
 
@@ -367,7 +403,7 @@ class WallLayerSeparator:
         if not self.select_wall():
             return
 
-        output.print_md("## Разбивка стены: **{}**".format(self.wall_type.Name))
+        output.print_md("## Разбивка стены: **{}**".format(self.get_element_name(self.wall_type)))
 
         # 2. Получение информации о слоях
         layers_info = self.get_wall_info()
@@ -399,7 +435,8 @@ class WallLayerSeparator:
             # 5. Создаём новые типы стен
             output.print_md("### Создание новых типов стен...")
             new_wall_types = []
-            base_name = self.wall_type.Name.split('_')[0]  # Берём базовое имя
+            wall_type_name = self.get_element_name(self.wall_type)
+            base_name = wall_type_name.split('_')[0] if wall_type_name else "Стена"
 
             for layer in layers_info:
                 new_type = self.create_single_layer_wall_type(layer, base_name)
@@ -429,7 +466,7 @@ class WallLayerSeparator:
                 self.new_walls.append(new_wall)
 
                 output.print_md("✓ Создана стена: **{}**".format(
-                    pos_data['layer']['new_type'].Name
+                    self.get_element_name(pos_data['layer']['new_type'])
                 ))
 
             # 8. Переносим вложенные элементы на ближайшую новую стену
@@ -444,7 +481,7 @@ class WallLayerSeparator:
                     try:
                         element.Host = main_wall
                         output.print_md("✓ Перенесён элемент: **{}**".format(
-                            element.Name
+                            self.get_element_name(element)
                         ))
                     except Exception as e:
                         output.print_md("✗ Ошибка переноса: {}".format(str(e)))
