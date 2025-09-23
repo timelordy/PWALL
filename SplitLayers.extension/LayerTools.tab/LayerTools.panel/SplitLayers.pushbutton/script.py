@@ -19,6 +19,21 @@ from pyrevit.forms import TemplateListItem
 
 from Autodesk.Revit import DB
 
+try:
+    from Autodesk.Revit.UI.Selection import ISelectionFilter as _RevitSelectionFilterBase
+except ImportError:
+    from Autodesk.Revit.UI import Selection as _RevitSelectionModule
+
+    _RevitSelectionFilterBase = getattr(_RevitSelectionModule, "ISelectionFilter", None)
+
+if _RevitSelectionFilterBase is None:
+    _RevitSelectionFilterBase = getattr(DB, "ISelectionFilter", None)
+
+if _RevitSelectionFilterBase is None:
+    raise ImportError(
+        "Не удалось загрузить ISelectionFilter из API Revit. Проверьте версию pyRevit/Revit."
+    )
+
 __title__ = "Разделить стену по слоям"
 __author__ = "pw-team"
 
@@ -88,7 +103,7 @@ class LayerInfo(object):
 
 
 def _pick_wall():
-    class WallSelectionFilter(DB.ISelectionFilter):
+    class WallSelectionFilter(_RevitSelectionFilterBase):
         def AllowElement(self, element):
             return isinstance(element, DB.Wall)
 
