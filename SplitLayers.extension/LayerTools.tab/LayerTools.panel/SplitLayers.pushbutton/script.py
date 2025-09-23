@@ -12,11 +12,7 @@
 8. Исходная стена удаляется, а новые стены объединяются Join Geometry.
 """
 
-from __future__ import annotations
-
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 from pyrevit import forms, revit, script
 from pyrevit.forms import TemplateListItem
@@ -27,32 +23,43 @@ __title__ = "Разделить стену по слоям"
 __author__ = "pw-team"
 
 
-@dataclass
 class LayerInfo(object):
-    index: int
-    name: str
-    width: float
-    material_id: DB.ElementId
-    function: DB.MaterialFunctionAssignment
-    offset: float
-    is_core: bool
+    """Информация об одном слое составной стены."""
 
-    wall_type: Optional[DB.WallType] = None
-    new_wall: Optional[DB.Wall] = None
-    translation: Optional[DB.XYZ] = None
+    def __init__(
+        self,
+        index,
+        name,
+        width,
+        material_id,
+        function,
+        offset,
+        is_core,
+    ):
+        self.index = index
+        self.name = name
+        self.width = width
+        self.material_id = material_id
+        self.function = function
+        self.offset = offset
+        self.is_core = is_core
+
+        self.wall_type = None
+        self.new_wall = None
+        self.translation = None
 
     @property
-    def width_mm(self) -> float:
+    def width_mm(self):
         return DB.UnitUtils.ConvertFromInternalUnits(
             self.width, DB.UnitTypeId.Millimeters
         )
 
     @property
-    def display_name(self) -> str:
+    def display_name(self):
         return "{} ({:.1f} мм)".format(self.name, self.width_mm)
 
 
-def _pick_wall() -> DB.Wall:
+def _pick_wall():
     class WallSelectionFilter(DB.ISelectionFilter):
         def AllowElement(self, element):
             return isinstance(element, DB.Wall)
@@ -70,7 +77,7 @@ def _pick_wall() -> DB.Wall:
     return wall
 
 
-def _get_layers(wall: DB.Wall) -> List[LayerInfo]:
+def _get_layers(wall):
     wall_type = revit.doc.GetElement(wall.GetTypeId())
     if not isinstance(wall_type, DB.WallType) or wall_type.Kind != DB.WallKind.Basic:
         forms.alert(
@@ -118,7 +125,7 @@ def _get_layers(wall: DB.Wall) -> List[LayerInfo]:
     return layers_info
 
 
-def _select_layers(layers: List[LayerInfo]) -> List[LayerInfo]:
+def _select_layers(layers):
     items = []
     for layer in layers:
         label = layer.display_name
@@ -138,7 +145,7 @@ def _select_layers(layers: List[LayerInfo]) -> List[LayerInfo]:
     return [item.value for item in selected]
 
 
-def _collect_wall_types() -> Dict[int, DB.WallType]:
+def _collect_wall_types():
     collector = DB.FilteredElementCollector(revit.doc).OfClass(DB.WallType)
     result = {}
     for wall_type in collector:
@@ -151,7 +158,7 @@ def _collect_wall_types() -> Dict[int, DB.WallType]:
     return result
 
 
-def _wall_type_thickness(wall_type: DB.WallType) -> float:
+def _wall_type_thickness(wall_type):
     structure = wall_type.GetCompoundStructure()
     if not structure:
         return 0.0
@@ -161,9 +168,7 @@ def _wall_type_thickness(wall_type: DB.WallType) -> float:
     return total
 
 
-def _ask_mapping(
-    layers: List[LayerInfo], wall_types: Dict[int, DB.WallType]
-) -> Tuple[int, bool]:
+def _ask_mapping(layers, wall_types):
     tolerance = DB.UnitUtils.ConvertToInternalUnits(1.0, DB.UnitTypeId.Millimeters)
 
     components = []
@@ -221,7 +226,7 @@ def _ask_mapping(
     return host_index, join_new
 
 
-def _create_single_layer_type(base_type: DB.WallType, layer: LayerInfo) -> DB.WallType:
+def _create_single_layer_type(base_type, layer):
     new_name = "{} | {}".format(base_type.Name, layer.name)
 
     collector = DB.FilteredElementCollector(revit.doc).OfClass(DB.WallType)
@@ -239,8 +244,10 @@ def _create_single_layer_type(base_type: DB.WallType, layer: LayerInfo) -> DB.Wa
     return new_type
 
 
-def _copy_instance_parameters(source: DB.Element, target: DB.Element) -> None:
-    source_params = {p.Definition.Name: p for p in source.Parameters}
+def _copy_instance_parameters(source, target):
+    source_params = {}
+    for src_param in source.Parameters:
+        source_params[src_param.Definition.Name] = src_param
     for param in target.Parameters:
         if param.IsReadOnly:
             continue
@@ -264,11 +271,7 @@ def _copy_instance_parameters(source: DB.Element, target: DB.Element) -> None:
             continue
 
 
-def _create_new_wall(
-    layer: LayerInfo,
-    base_wall: DB.Wall,
-    base_type: DB.WallType,
-) -> DB.Wall:
+def _create_new_wall(layer, base_wall, base_type):
     location = base_wall.Location
     if not isinstance(location, DB.LocationCurve):
         raise ValueError("Стену с криволинейной геометрией обработать не удалось.")
@@ -297,7 +300,7 @@ def _create_new_wall(
     return new_wall
 
 
-def _collect_hosted_instances(wall: DB.Wall) -> List[DB.FamilyInstance]:
+def _collect_hosted_instances(wall):
     collector = DB.FilteredElementCollector(revit.doc).OfClass(DB.FamilyInstance)
     hosted = []
     for inst in collector:
@@ -307,11 +310,7 @@ def _collect_hosted_instances(wall: DB.Wall) -> List[DB.FamilyInstance]:
     return hosted
 
 
-def _create_hosted_instance(
-    source_instance: DB.FamilyInstance,
-    host_wall: DB.Wall,
-    translation_vector: DB.XYZ,
-) -> Optional[DB.FamilyInstance]:
+def _create_hosted_instance(source_instance, host_wall, translation_vector):
     location = source_instance.Location
     if not isinstance(location, DB.LocationPoint):
         return None
@@ -354,7 +353,7 @@ def _create_hosted_instance(
     return new_instance
 
 
-def _join_walls(walls: List[DB.Wall]) -> None:
+def _join_walls(walls):
     count = len(walls)
     for i in range(count):
         for j in range(i + 1, count):
