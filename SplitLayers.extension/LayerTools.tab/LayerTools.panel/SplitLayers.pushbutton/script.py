@@ -383,8 +383,7 @@ class WallLayerSeparator:
     def get_hosted_elements(self):
         """Получение всех вложенных элементов (окна, двери и т.д.)"""
 
-        # Используем фильтр для поиска элементов, привязанных к стене
-        filter = FamilyInstanceFilter(doc, self.original_wall.Id)
+        # Собираем кандидатов из всех экземпляров семейств в документе
         collector = FilteredElementCollector(doc)
 
         # Собираем все FamilyInstance элементы
