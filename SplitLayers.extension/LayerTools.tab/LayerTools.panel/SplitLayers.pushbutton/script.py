@@ -1,1083 +1,379 @@
 # -*- coding: utf-8 -*-
-"""
-Разбивка многослойной стены на отдельные стены по слоям
-для PyRevit / Revit 2022
-"""
+"""Разбивка составной стены на части (Parts) стандартными средствами Revit."""
 
 __title__ = 'Разбить\nСтену'
 __author__ = 'Wall Layers Separator'
 
 import clr
-import math
+
 from System import MissingMemberException
+from System.Collections.Generic import List
+
+try:
+    unicode  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - безопасность для Python 3
+    unicode = str
 
 # Импорт Revit API
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
-from Autodesk.Revit.DB import *
-from Autodesk.Revit.UI import *
-from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
-from Autodesk.Revit.DB.Structure import *
+from Autodesk.Revit.DB import (
+    BuiltInParameter,
+    ElementId,
+    MaterialFunctionAssignment,
+    PartUtils,
+    PartsVisibility,
+    UnitTypeId,
+    UnitUtils,
+    Wall,
+    WallType,
+)
+from Autodesk.Revit.UI.Selection import ObjectType
 
-# В разных версиях Revit класс StackedWallUtils может находиться в разных
-# пространствах имён или отсутствовать вовсе. Далее объявляется вспомогательная
-# переменная и функция поиска, чтобы использовать класс, когда он доступен, и
-# корректно обрабатывать случаи, когда API не предоставляет данный класс.
-StackedWallUtils = None
-
-
-def _get_stacked_wall_utils():
-    """Возвращает доступный класс StackedWallUtils или None без выброса NameError."""
-
-    global StackedWallUtils
-
-    # Если ранее уже удавалось определить класс, просто возвращаем его.
-    if StackedWallUtils:
-        return StackedWallUtils
-
-    candidate_namespaces = []
-
-    # Пытаемся получить класс из пространств имён, предоставляемых pyRevit.
-    candidate_namespaces.append(globals().get('DB'))
-
-    try:
-        candidate_namespaces.append(getattr(globals().get('DB'), 'Structure', None))
-    except Exception:
-        candidate_namespaces.append(None)
-
-    # Собираем пространства имён, импортируя их напрямую при необходимости.
-    for module_name in ('Autodesk.Revit.DB', 'Autodesk.Revit.DB.Structure'):
-        try:
-            module = __import__(module_name, fromlist=['StackedWallUtils'])
-            candidate_namespaces.append(module)
-        except Exception:
-            candidate_namespaces.append(None)
-
-    # Перебираем возможные пространства имён и пытаемся получить класс.
-    for namespace in candidate_namespaces:
-        if not namespace:
-            continue
-
-        try:
-            candidate = getattr(namespace, 'StackedWallUtils', None)
-        except Exception:
-            candidate = None
-
-        if candidate:
-            StackedWallUtils = candidate
-            return StackedWallUtils
-
-    return None
 # Импорт PyRevit
-from pyrevit import revit, DB, UI
-from pyrevit import forms
-from pyrevit import script
+def _load_pyrevit_modules():
+    from pyrevit import revit, forms, script
+    return revit, forms, script
 
-# Получаем документ и UI
+revit, forms, script = _load_pyrevit_modules()
+
 doc = revit.doc
 uidoc = revit.uidoc
 output = script.get_output()
 
 
-def sanitize_name(name):
-    """Удаление недопустимых символов и лишних пробелов из имени."""
-    if not name:
-        return ""
-
-    invalid_chars = '<>:"/\\|?*'
-    cleaned = []
-    for char in name:
-        if char in invalid_chars:
-            cleaned.append('-')
-        else:
-            cleaned.append(char)
-
-    normalized = "".join(cleaned)
-    normalized = normalized.replace('\n', ' ').replace('\r', ' ')
-    normalized = " ".join(normalized.split())
-    return normalized.strip()
-
-
-def generate_default_type_name(base_name, material_name, thickness_mm, index):
-    """Формирование наглядного и уникального имени типа стены."""
-    base = sanitize_name(base_name) or u"Стена"
-    material = sanitize_name(material_name) or u"Слой {}".format(index + 1)
-    thickness_value = int(round(thickness_mm or 0))
-    return u"{}_L{}_{}_{}мм".format(base, index + 1, material, thickness_value)
-
-
-def _vector_length(vector):
-    """Вычисление длины вектора XYZ."""
-    if vector is None:
+def convert_to_mm(value):
+    """Перевод значения из внутренних единиц Revit в миллиметры."""
+    if value is None:
         return 0.0
 
     try:
-        return math.sqrt(vector.X ** 2 + vector.Y ** 2 + vector.Z ** 2)
+        return round(UnitUtils.ConvertFromInternalUnits(value, UnitTypeId.Millimeters), 1)
     except Exception:
-        return 0.0
+        try:
+            return round(value * 304.8, 1)
+        except Exception:
+            return 0.0
 
 
-def _normalize_vector(vector):
-    """Нормализация вектора. Возвращает None, если длина слишком мала."""
-    length = _vector_length(vector)
-    if length <= 1e-9:
-        return None
+def get_element_name(element, default=u"Без имени"):
+    """Безопасно получает имя элемента Revit."""
+    if not element:
+        return default
 
     try:
-        return XYZ(vector.X / length, vector.Y / length, vector.Z / length)
-    except Exception:
-        return None
+        name = element.Name
+        if name:
+            return name
+    except (AttributeError, MissingMemberException):
+        pass
 
-
-def _scale_vector(vector, scalar):
-    """Масштабирование вектора на скаляр."""
-    if vector is None:
-        return None
-
-    try:
-        return XYZ(vector.X * scalar, vector.Y * scalar, vector.Z * scalar)
-    except Exception:
-        return None
-
-
-def _add_xyz(point, vector):
-    """Сложение точки и вектора."""
-    if point is None or vector is None:
-        return None
-
-    try:
-        return XYZ(point.X + vector.X, point.Y + vector.Y, point.Z + vector.Z)
-    except Exception:
-        return None
-
-
-def _subtract_xyz(point_a, point_b):
-    """Вычитание двух точек XYZ."""
-    if point_a is None or point_b is None:
-        return None
+    for param_id in (
+        BuiltInParameter.ALL_MODEL_TYPE_NAME,
+        BuiltInParameter.SYMBOL_NAME_PARAM,
+        BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM,
+        BuiltInParameter.PART_MATERIAL_NAME,
+    ):
+        try:
+            param = element.get_Parameter(param_id)
+            if param and param.HasValue:
+                name = param.AsString()
+                if name:
+                    return name
+        except Exception:
+            continue
 
     try:
-        return XYZ(point_a.X - point_b.X, point_a.Y - point_b.Y, point_a.Z - point_b.Z)
+        return u"ID {}".format(element.Id.IntegerValue)
     except Exception:
-        return None
+        return default
 
 
-class LayerUIData(object):
-    """Описание слоя для отображения в пользовательском интерфейсе."""
-
-    def __init__(self, layer_info, default_name):
-        self.layer_info = layer_info
-        self.MaterialName = layer_info.get('material_name') or u"Слой {}".format(layer_info.get('index', 0) + 1)
-        self.ThicknessDisplay = u"{:.1f} мм".format(layer_info.get('width_mm', 0.0))
-        self.ReplacementName = default_name
-        self.DefaultName = default_name
-        self.Selected = True
-
-    @property
-    def display_label(self):
-        return u"{} ({:.1f} мм)".format(self.MaterialName, self.layer_info.get('width_mm', 0.0))
+_LAYER_FUNCTION_MAP = {
+    MaterialFunctionAssignment.Structure: u"Несущий слой",
+    MaterialFunctionAssignment.Substrate: u"Основание",
+    MaterialFunctionAssignment.Insulation: u"Утеплитель",
+    MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
+    MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
+    MaterialFunctionAssignment.Membrane: u"Мембрана",
+    MaterialFunctionAssignment.Other: u"Прочий слой",
+}
 
 
-class LayerSelectionWindow(forms.WPFWindow):
-    """Окно выбора слоёв и задания имён новых типов стен."""
+def describe_layer_function(layer_function):
+    """Текстовое описание функции слоя."""
+    return _LAYER_FUNCTION_MAP.get(layer_function, unicode(layer_function))
 
-    def __init__(self, layers_info, base_name):
-        xaml_path = script.get_bundle_file('LayerSelection.xaml')
-        forms.WPFWindow.__init__(self, xaml_path)
 
-        self.layers_info = layers_info
-        self.base_name = base_name
-        self.layer_items = []
-        self._selected_items = []
+class CompositeWallPartsPipeline(object):
+    """Реализует пайплайн: подготовка вида → создание Parts → отчёт."""
 
-        self._build_layers()
-
-    def _build_layers(self):
-        """Создание элементов интерфейса для списка слоёв."""
-        from System.Windows.Controls import CheckBox
-        from System.Windows import Thickness
-
-        for idx, layer in enumerate(self.layers_info):
-            default_name = generate_default_type_name(
-                self.base_name,
-                layer.get('material_name'),
-                layer.get('width_mm'),
-                layer.get('index', idx)
-            )
-
-            item = LayerUIData(layer, default_name)
-            self.layer_items.append(item)
-
-            checkbox = CheckBox()
-            checkbox.Content = item.display_label
-            checkbox.IsChecked = True
-            checkbox.Tag = item
-            checkbox.Margin = Thickness(0, 0, 0, 6)
-            checkbox.Checked += self._checkbox_changed
-            checkbox.Unchecked += self._checkbox_changed
-            self.LayersPanel.Children.Add(checkbox)
-
-        self._refresh_grid()
-
-    def _checkbox_changed(self, sender, args):
-        item = getattr(sender, 'Tag', None)
-        if item:
-            item.Selected = bool(sender.IsChecked)
-        self._refresh_grid()
-
-    def _refresh_grid(self):
-        selected = [item for item in self.layer_items if item.Selected]
-        self.LayerGrid.ItemsSource = selected
-        self.LayerGrid.Items.Refresh()
-
-    def ok_click(self, sender, args):
-        selected = [item for item in self.layer_items if item.Selected]
-        if not selected:
-            forms.alert(u"Выберите хотя бы один слой для разбивки.")
-            return
-
-        self._selected_items = selected
-        self.DialogResult = True
-        self.Close()
-
-    def cancel_click(self, sender, args):
-        self.DialogResult = False
-        self.Close()
-
-    def get_selected_layers(self):
-        """Возвращает список выбранных слоёв с пользовательскими именами."""
-        results = []
-        for item in getattr(self, '_selected_items', []):
-            layer_copy = dict(item.layer_info)
-            custom_name = sanitize_name(item.ReplacementName) or item.DefaultName
-            if not custom_name:
-                custom_name = generate_default_type_name(
-                    self.base_name,
-                    layer_copy.get('material_name'),
-                    layer_copy.get('width_mm'),
-                    layer_copy.get('index', 0)
-                )
-            layer_copy['custom_type_name'] = custom_name
-            results.append(layer_copy)
-        return results
-
-class WallLayerSeparator:
     def __init__(self):
         self.doc = doc
         self.uidoc = uidoc
-        self.original_wall = None
+        self.view = uidoc.ActiveView
+        self.wall = None
         self.wall_type = None
-        self.wall_kind = None
-        self.is_stacked = False
-        self.structure_source_type = None
         self.compound_structure = None
-        self.new_walls = []
-        self.hosted_elements = []
-        self.stacked_member_types = []
 
-    def _initialize_stacked_wall_data(self):
-        """Попытка получить структуру слоёв из сегментов составной стены."""
-
-        global StackedWallUtils
-
-        self.stacked_member_types = []
-
-        stacked_utils = _get_stacked_wall_utils()
-
-        if stacked_utils is None:
+    # ---------------------------- служебные методы ----------------------------
+    def _ensure_view_ready(self):
+        """Включает отображение частей на активном виде."""
+        view = self.view
+        if not view:
             output.print_md(
-                u"⚠️ Класс `StackedWallUtils` недоступен в текущей версии Revit API."
+                u"⚠️ Активный вид не найден. Части будут созданы, но их может не быть видно."
             )
-            return
-
-        try:
-            member_ids = stacked_utils.GetMemberIds(self.original_wall)
-        except NameError:
-            StackedWallUtils = None
-            output.print_md(
-                u"⚠️ Класс `StackedWallUtils` недоступен в текущей версии Revit API."
-            )
-            return
-        except Exception as e:
-            output.print_md(
-                u"⚠️ Не удалось получить сегменты составной стены: {}".format(e)
-            )
-            return
-
-        if not member_ids:
-            output.print_md(
-                u"⚠️ API вернул пустой список сегментов для составной стены."
-            )
-            return
-
-        seen_type_ids = set()
-
-        for member_id in member_ids:
-            try:
-                member_wall = doc.GetElement(member_id)
-            except Exception:
-                member_wall = None
-
-            if not isinstance(member_wall, Wall):
-                continue
-
-            member_type = member_wall.WallType
-            if not isinstance(member_type, WallType):
-                continue
-
-            type_id_value = member_type.Id.IntegerValue
-            if type_id_value in seen_type_ids:
-                continue
-
-            seen_type_ids.add(type_id_value)
-            self.stacked_member_types.append(member_type)
-
-            if (self.structure_source_type is None or
-                    (self.structure_source_type and self.structure_source_type.Id == self.wall_type.Id)):
-                self.structure_source_type = member_type
-
-            if not self.compound_structure:
-                try:
-                    struct = member_type.GetCompoundStructure()
-                except Exception:
-                    struct = None
-
-                if struct and getattr(struct, 'LayerCount', 0) > 0:
-                    self.compound_structure = struct
-                    self.structure_source_type = member_type
-
-        if self.stacked_member_types:
-            output.print_md("### Сегменты составной стены:")
-            for member_type in self.stacked_member_types:
-                output.print_md("- {}".format(self.get_element_name(member_type)))
-
-        if self.compound_structure and self.structure_source_type:
-            output.print_md(
-                u"ℹ️ Обнаружена составная (stacked) стена. Структура слоёв взята из сегмента типа `{}`.".format(
-                    self.get_element_name(self.structure_source_type)
-                )
-            )
-        elif self.stacked_member_types:
-            output.print_md(
-                u"⚠️ Сегменты составной стены получены, но их структура слоёв недоступна. Будет использован упрощённый расчёт ширины."
-            )
-
-    def get_element_name(self, element, default="Без имени"):
-        """Безопасное получение имени элемента Revit"""
-        if not element:
-            return default
-
-        # Сначала пытаемся получить свойство Name напрямую
-        try:
-            name = element.Name
-            if name:
-                return name
-        except (AttributeError, MissingMemberException):
-            pass
-
-        # Если свойства нет, пробуем получить значение из параметров
-        param_ids = [
-            BuiltInParameter.ALL_MODEL_TYPE_NAME,
-            BuiltInParameter.SYMBOL_NAME_PARAM,
-            BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM
-        ]
-
-        for param_id in param_ids:
-            try:
-                param = element.get_Parameter(param_id)
-                if param and param.HasValue:
-                    name = param.AsString()
-                    if name:
-                        return name
-            except Exception:
-                continue
-
-        # В крайнем случае возвращаем идентификатор элемента
-        try:
-            return "ID {}".format(element.Id.IntegerValue)
-        except Exception:
-            return default
-
-    def select_wall(self):
-        """Выбор стены пользователем"""
-        try:
-            reference = uidoc.Selection.PickObject(
-                ObjectType.Element,
-                "Выберите многослойную стену для разбивки"
-            )
-            self.original_wall = doc.GetElement(reference.ElementId)
-
-            if not isinstance(self.original_wall, Wall):
-                forms.alert("Выбран не стеновой элемент!", exitscript=True)
-                return False
-
-            self.wall_type = self.original_wall.WallType
-            self.wall_kind = getattr(self.wall_type, 'Kind', None)
-            self.is_stacked = self.wall_kind == WallKind.Stacked if self.wall_kind is not None else False
-            self.structure_source_type = self.wall_type
-            self.stacked_member_types = []
-
-            # Пробуем получить структуру разными способами
-            self.compound_structure = None
-
-            # Способ 1: напрямую от типа
-            try:
-                self.compound_structure = self.wall_type.GetCompoundStructure()
-                if self.compound_structure:
-                    self.structure_source_type = self.wall_type
-            except:
-                pass
-
-            # Способ 2: через параметр WALL_STRUCTURE_ID_PARAM
-            if not self.compound_structure:
-                try:
-                    struct_param = self.wall_type.get_Parameter(
-                        BuiltInParameter.WALL_STRUCTURE_ID_PARAM
-                    )
-                    if struct_param:
-                        struct_id = struct_param.AsElementId()
-                        if struct_id and struct_id != ElementId.InvalidElementId:
-                            struct_elem = doc.GetElement(struct_id)
-                            if hasattr(struct_elem, 'GetCompoundStructure'):
-                                self.compound_structure = struct_elem.GetCompoundStructure()
-                                if self.compound_structure:
-                                    self.structure_source_type = self.wall_type
-                except:
-                    pass
-
-            # Способ 3: проверяем, может это системная стена
-            if not self.compound_structure:
-                try:
-                    # Для системных семейств стен
-                    if self.wall_type.Kind == WallKind.Basic:
-                        # Пробуем создать временную структуру
-                        width_param = self.wall_type.get_Parameter(
-                            BuiltInParameter.WALL_ATTR_WIDTH_PARAM
-                        )
-                        if width_param:
-                            width = width_param.AsDouble()
-                            if width > 0:
-                                # Это однослойная стена - создаём структуру
-                                material_param = self.wall_type.get_Parameter(
-                                    BuiltInParameter.STRUCTURAL_MATERIAL_PARAM
-                                )
-                                material_id = material_param.AsElementId() if material_param else ElementId.InvalidElementId
-
-                                # Проверяем, действительно ли это однослойная стена
-                                output.print_md("⚠️ Обнаружена базовая стена без составной структуры")
-                                output.print_md("Тип: {}".format(self.get_element_name(self.wall_type)))
-                                output.print_md("Толщина: {} мм".format(round(width * 304.8, 1)))
-
-                                forms.alert("Это базовая однослойная стена!\nИспользуйте для многослойных стен.",
-                                            exitscript=True)
-                                return False
-                except:
-                    pass
-
-            if self.is_stacked:
-                self._initialize_stacked_wall_data()
-
-            # Проверяем на наличие редактированного профиля
-            if not self.compound_structure:
-                # Проверка на модифицированную геометрию
-                try:
-                    if hasattr(self.original_wall, 'IsModified') and self.original_wall.IsModified:
-                        output.print_md("⚠️ **Стена имеет модифицированную геометрию**")
-                except:
-                    pass
-
-                # Проверка на вертикальную структуру
-                has_profile = False
-                try:
-                    profile_param = self.original_wall.get_Parameter(
-                        BuiltInParameter.WALL_SWEEP_PROFILE_PARAM
-                    )
-                    if profile_param and profile_param.HasValue:
-                        has_profile = True
-                except:
-                    pass
-
-                if has_profile:
-                    output.print_md("⚠️ **Стена имеет редактируемый профиль**")
-
-            if not self.compound_structure:
-                if self.is_stacked:
-                    output.print_md(
-                        u"⚠️ Структура слоёв составной стены недоступна. Разбивка будет выполнена на основе общей толщины."
-                    )
-                else:
-                    # Выводим отладочную информацию
-                    output.print_md("### Отладочная информация:")
-                    output.print_md("- Имя типа: **{}**".format(self.get_element_name(self.wall_type)))
-                    output.print_md("- ID типа: **{}**".format(self.wall_type.Id))
-                    output.print_md("- Тип стены (Kind): **{}**".format(self.wall_type.Kind))
-
-                    # Проверяем все параметры типа
-                    params_info = []
-                    for param in self.wall_type.Parameters:
-                        if param.HasValue:
-                            try:
-                                value = param.AsValueString() or str(param.AsElementId().IntegerValue)
-                                params_info.append("{}: {}".format(param.Definition.Name, value))
-                            except:
-                                pass
-
-                    if params_info:
-                        output.print_md("### Параметры типа стены:")
-                        for info in params_info[:10]:  # Первые 10 параметров
-                            output.print_md("- {}".format(info))
-
-                    forms.alert(
-                        "Стена не имеет многослойной структуры!\n\nВозможные причины:\n1. Это не составная стена\n2. Стена имеет модификации\n3. Используется сложный профиль",
-                        exitscript=True)
-                    return False
-
-            if self.compound_structure and self.compound_structure.LayerCount < 2:
-                forms.alert("Стена имеет только {} слой!\nДля разбивки нужно минимум 2 слоя.".format(
-                    self.compound_structure.LayerCount
-                ), exitscript=True)
-                return False
-
-            return True
-
-        except Exception as e:
-            forms.alert("Ошибка при выборе стены:\n{}".format(str(e)), exitscript=True)
             return False
 
-    def get_wall_info(self):
-        """Получение информации о слоях стены"""
-        layers_info = []
-
-        # Если есть CompoundStructure - используем её
-        if self.compound_structure:
-            for i in range(self.compound_structure.LayerCount):
-                layer_func = self.compound_structure.GetLayerFunction(i)
-                layer_width = self.compound_structure.GetLayerWidth(i)
-                layer_material_id = self.compound_structure.GetMaterialId(i)
-
-                material = doc.GetElement(layer_material_id) if layer_material_id else None
-                material_name = self.get_element_name(material, default="Без материала")
-
-                layers_info.append({
-                    'index': i,
-                    'function': layer_func,
-                    'width': layer_width,
-                    'material_id': layer_material_id,
-                    'material_name': material_name,
-                    'width_mm': round(layer_width * 304.8, 1),  # футы в мм
-                    'is_core': self.compound_structure.IsCoreLayer(i) if hasattr(self.compound_structure, 'IsCoreLayer') else False
-                })
-        else:
-            # Альтернативный метод для стен без CompoundStructure
-            # Пытаемся получить информацию через параметры
-            output.print_md("⚠️ Используется альтернативный метод получения слоёв")
-
-            # Получаем общую толщину
-            source_type = self.structure_source_type or self.wall_type
-            width_param = source_type.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM) if source_type else None
-            if width_param:
-                total_width = width_param.AsDouble()
-
-                # Создаём псевдо-слой
-                material_param = source_type.get_Parameter(BuiltInParameter.STRUCTURAL_MATERIAL_PARAM) if source_type else None
-                material_id = material_param.AsElementId() if material_param else ElementId.InvalidElementId
-                material = doc.GetElement(material_id) if material_id != ElementId.InvalidElementId else None
-
-                layers_info.append({
-                    'index': 0,
-                    'function': MaterialFunctionAssignment.Structure,
-                    'width': total_width,
-                    'material_id': material_id,
-                    'material_name': self.get_element_name(material, default="Основной материал"),
-                    'width_mm': round(total_width * 304.8, 1),
-                    'is_core': True
-                })
-
-        return layers_info
-
-    def get_creation_height(self):
-        """Получение высоты исходной стены для создания новых"""
-
-        # Пробуем получить «несвязанную» высоту стены
         try:
-            height_param = self.original_wall.get_Parameter(
-                BuiltInParameter.WALL_USER_HEIGHT_PARAM
+            current_visibility = view.PartsVisibility
+        except Exception as exc:
+            output.print_md(
+                u"⚠️ Не удалось прочитать настройку Parts Visibility: {}".format(exc)
             )
-            if height_param and height_param.HasValue:
-                height = height_param.AsDouble()
-                if height and height > 0:
-                    return height
-        except Exception:
-            pass
+            return False
 
-        # Если параметр не дал результата — оцениваем высоту по габаритному контейнеру
+        if current_visibility in (PartsVisibility.ShowParts, PartsVisibility.ShowPartsAndOriginal):
+            return True
+
         try:
-            bbox = self.original_wall.get_BoundingBox(None)
-            if bbox:
-                height = bbox.Max.Z - bbox.Min.Z
-                if height and height > 0:
-                    return height
-        except Exception:
-            pass
-
-        # Последний вариант — используем стандартное значение 3000 мм
-        return UnitUtils.ConvertToInternalUnits(3000, UnitTypeId.Millimeters)
-
-    def create_single_layer_wall_type(self, layer_info, base_name):
-        """Создание нового типа стены с одним слоем"""
-
-        desired_name = layer_info.get('custom_type_name')
-        if desired_name:
-            new_name = sanitize_name(desired_name)
-        else:
-            new_name = ""
-
-        if not new_name:
-            new_name = generate_default_type_name(
-                base_name,
-                layer_info.get('material_name'),
-                layer_info.get('width_mm'),
-                layer_info.get('index', 0)
+            view.PartsVisibility = PartsVisibility.ShowParts
+            output.print_md(
+                u"ℹ️ Активный вид переключён на режим отображения частей (Parts)."
             )
+            return True
+        except Exception as exc:
+            output.print_md(
+                u"⚠️ Не удалось автоматически включить отображение Parts. Причина: {}".format(exc)
+            )
+            output.print_md(
+                u"   Проверьте, не управляет ли параметром шаблон вида, и при необходимости снимите галочку."
+            )
+            return False
 
-        # Ограничиваем длину имени, чтобы избежать ошибок API
-        if len(new_name) > 60:
-            new_name = new_name[:60]
+    def _get_existing_parts(self):
+        """Возвращает список уже созданных частей для выбранной стены."""
+        if not self.wall:
+            return []
 
-        # Проверяем, существует ли уже такой тип
-        existing = None
-        collector = FilteredElementCollector(doc).OfClass(WallType)
-        for wt in collector:
-            wt_name_param = wt.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
-            wt_name = wt_name_param.AsString() if wt_name_param else None
-            if wt_name == new_name:
-                existing = wt
-                break
+        wall_id = self.wall.Id
 
-        if existing:
-            return existing
-
-        # Создаём новый тип
-        source_type = self.structure_source_type or self.wall_type
-        if source_type is None:
-            source_type = self.wall_type
-
-        if source_type is None:
-            raise Exception("Не удалось определить исходный тип стены для дублирования")
-
-        new_wall_type = source_type.Duplicate(new_name)
-        if isinstance(new_wall_type, ElementId):
-            new_wall_type = doc.GetElement(new_wall_type)
-
-        # Создаём структуру с одним слоем
         try:
-            new_compound = CompoundStructure.CreateSingleLayerCompoundStructure(
-                layer_info['function'],
-                layer_info['width'],
-                layer_info['material_id']
-            )
-
-            # Применяем структуру к новому типу
-            new_wall_type.SetCompoundStructure(new_compound)
-        except Exception as e:
-            # Если не получилось создать CompoundStructure, просто меняем толщину
-            output.print_md("⚠️ Альтернативное создание типа: {}".format(new_name))
-            width_param = new_wall_type.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM)
-            if width_param and not width_param.IsReadOnly:
-                width_param.Set(layer_info['width'])
-
-        return new_wall_type
-
-    def calculate_wall_positions(self, layers_info):
-        """Расчёт позиций для новых стен"""
-
-        # Получаем линию расположения стены
-        location_curve = self.original_wall.Location
-        if not isinstance(location_curve, LocationCurve):
-            raise Exception("Стена не имеет линии расположения")
-
-        wall_curve = location_curve.Curve
-
-        # Нормализованный вектор, направленный к внешней стороне стены
-        orientation_vector = _normalize_vector(getattr(self.original_wall, 'Orientation', None))
-
-        if orientation_vector is None:
-            # Резервный путь: используем перпендикуляр, рассчитанный по координатам
+            part_ids = PartUtils.GetAssociatedParts(self.doc, wall_id)
+        except TypeError:
             try:
-                wall_line = wall_curve
-                start_point = wall_line.GetEndPoint(0)
-                end_point = wall_line.GetEndPoint(1)
-                direction = _normalize_vector(_subtract_xyz(end_point, start_point))
+                part_ids = PartUtils.GetAssociatedParts(self.doc, wall_id, False)
             except Exception:
-                direction = None
-
-            if direction is None:
-                raise Exception("Не удалось определить ориентацию стены")
-
-            orientation_vector = XYZ(-direction.Y, direction.X, 0)
-            if self.original_wall.Flipped:
-                orientation_vector = XYZ(-orientation_vector.X, -orientation_vector.Y, -orientation_vector.Z)
-
-            orientation_vector = _normalize_vector(orientation_vector)
-
-        if orientation_vector is None:
-            raise Exception("Не удалось определить направление внешней стороны стены")
-
-        total_width = sum([layer.get('width', 0.0) for layer in layers_info])
-
-        cumulative = 0.0
-        core_start = 0.0
-        core_end = total_width
-        first_core_found = False
-
-        for layer in layers_info:
-            width = layer.get('width', 0.0)
-            layer['start_from_exterior'] = cumulative
-            layer['center_from_exterior'] = cumulative + width / 2.0
-
-            if layer.get('is_core'):
-                if not first_core_found:
-                    core_start = cumulative
-                    first_core_found = True
-                core_end = cumulative + width
-
-            cumulative += width
-
-        if not first_core_found:
-            core_start = 0.0
-            core_end = total_width
-
-        location_reference = total_width / 2.0
-        try:
-            location_line = WallUtils.GetWallLocationLine(self.original_wall)
+                part_ids = []
         except Exception:
-            location_line = None
+            part_ids = []
 
-        if location_line == WallLocationLine.FinishFaceExterior:
-            location_reference = 0.0
-        elif location_line == WallLocationLine.FinishFaceInterior:
-            location_reference = total_width
-        elif location_line == WallLocationLine.CoreExterior:
-            location_reference = core_start
-        elif location_line == WallLocationLine.CoreInterior:
-            location_reference = core_end
-        elif location_line == WallLocationLine.CoreCenterline:
-            location_reference = (core_start + core_end) / 2.0
+        if not part_ids:
+            return []
 
-        positions = []
+        return [pid for pid in part_ids]
 
-        for layer in layers_info:
-            width = layer.get('width', 0.0)
+    def _collect_layers(self):
+        """Формирует подробности о слоях из CompoundStructure."""
+        layers = []
+        structure = self.compound_structure
 
-            if width <= 1e-6:
-                output.print_md(
-                    u"⚠️ Слой `{}` имеет нулевую толщину и будет пропущен.".format(
-                        layer.get('material_name', u"Слой {}".format(layer.get('index', 0) + 1))
-                    )
-                )
-                continue
+        if not structure:
+            return layers
 
-            center_from_exterior = layer.get('center_from_exterior', 0.0)
-            offset_from_location = location_reference - center_from_exterior
-
-            offset_vector = _scale_vector(orientation_vector, offset_from_location)
-            if offset_vector is None:
-                raise Exception("Не удалось вычислить смещение для слоя")
+        for index in range(structure.LayerCount):
+            try:
+                width = structure.GetLayerWidth(index)
+            except Exception:
+                width = 0.0
 
             try:
-                if isinstance(wall_curve, Line):
-                    start_point = wall_curve.GetEndPoint(0)
-                    end_point = wall_curve.GetEndPoint(1)
-                    new_start = _add_xyz(start_point, offset_vector)
-                    new_end = _add_xyz(end_point, offset_vector)
-                    new_curve = Line.CreateBound(new_start, new_end)
-                else:
-                    new_curve = wall_curve.CreateOffset(offset_from_location, XYZ.BasisZ)
+                function = structure.GetLayerFunction(index)
             except Exception:
-                translation = Transform.CreateTranslation(offset_vector)
-                new_curve = wall_curve.CreateTransformed(translation)
+                function = MaterialFunctionAssignment.Other
 
-            positions.append({
-                'layer': layer,
-                'curve': new_curve,
-                'offset': offset_from_location
+            try:
+                material_id = structure.GetMaterialId(index)
+            except Exception:
+                material_id = ElementId.InvalidElementId
+
+            material = self.doc.GetElement(material_id) if material_id else None
+
+            layers.append({
+                'index': index + 1,
+                'raw_index': index,
+                'width': width,
+                'width_mm': convert_to_mm(width),
+                'material_id': material_id,
+                'material_name': get_element_name(material, default=u"Без материала"),
+                'function': function,
+                'is_core': structure.IsCoreLayer(index) if hasattr(structure, 'IsCoreLayer') else False,
             })
 
-        return positions
+        return layers
 
-    def get_hosted_elements(self):
-        """Получение всех вложенных элементов (окна, двери и т.д.)"""
+    def _report_layers(self, layers):
+        """Выводит на экран информацию о слоях."""
+        if not layers:
+            output.print_md(u"⚠️ В структуре стены не найдено слоёв.")
+            return
 
-        # Собираем кандидатов из всех экземпляров семейств в документе
-        collector = FilteredElementCollector(doc)
-
-        # Собираем все FamilyInstance элементы
-        all_instances = collector.OfClass(FamilyInstance).ToElements()
-
-        hosted = []
-        for instance in all_instances:
-            if instance.Host and instance.Host.Id == self.original_wall.Id:
-                hosted.append(instance)
-
-        return hosted
-
-    def copy_parameters(self, from_wall, to_wall):
-        """Копирование параметров со старой стены на новую"""
-
-        # Список параметров для копирования. Для каждого имени указаны варианты,
-        # которые встречаются в разных версиях Revit API. Это защищает код от
-        # AttributeError при отсутствии конкретного перечислителя.
-        param_name_map = [
-            ("WALL_BASE_CONSTRAINT", "WALL_BASE_CONSTRAINT_PARAM"),
-            ("WALL_BASE_OFFSET", "WALL_BASE_OFFSET_PARAM"),
-            ("WALL_HEIGHT_TYPE", "WALL_TOP_CONSTRAINT", "WALL_TOP_CONSTRAINT_PARAM"),
-            ("WALL_TOP_CONSTRAINT", "WALL_TOP_CONSTRAINT_PARAM", "WALL_HEIGHT_TYPE"),
-            ("WALL_TOP_OFFSET", "WALL_TOP_OFFSET_PARAM"),
-            ("WALL_USER_HEIGHT_PARAM", "WALL_USER_HEIGHT")
-        ]
-
-        params_to_copy = []
-        resolved_params = set()
-
-        for names in param_name_map:
-            if isinstance(names, str):
-                candidates = (names,)
-            else:
-                candidates = names
-
-            resolved_param = None
-            for name in candidates:
-                param_id = getattr(BuiltInParameter, name, None)
-                if param_id is not None:
-                    resolved_param = param_id
-                    if param_id not in resolved_params:
-                        params_to_copy.append(param_id)
-                        resolved_params.add(param_id)
-                    break
-
-            if resolved_param is None:
-                try:
-                    output.print_md(
-                        u"⚠️ Параметр `{}` недоступен в данной версии API".format(candidates[0])
-                    )
-                except Exception:
-                    pass
-
-        for param_id in params_to_copy:
-            try:
-                from_param = from_wall.get_Parameter(param_id)
-                to_param = to_wall.get_Parameter(param_id)
-
-                if from_param and to_param and not to_param.IsReadOnly:
-                    if from_param.StorageType == StorageType.Double:
-                        to_param.Set(from_param.AsDouble())
-                    elif from_param.StorageType == StorageType.Integer:
-                        to_param.Set(from_param.AsInteger())
-                    elif from_param.StorageType == StorageType.ElementId:
-                        to_param.Set(from_param.AsElementId())
-                    elif from_param.StorageType == StorageType.String:
-                        to_param.Set(from_param.AsString())
-            except:
-                continue
-
-    def show_layer_selection_dialog(self, layers_info, base_name):
-        """Отображение окна выбора слоёв и возврат выбранных данных."""
-
-        try:
-            window = LayerSelectionWindow(layers_info, base_name)
-            dialog_result = window.ShowDialog()
-        except Exception as e:
+        output.print_md(u"### Слои составной стены:")
+        for layer in layers:
+            badge = u" (сердцевина)" if layer.get('is_core') else u""
             output.print_md(
-                u"⚠️ Не удалось отобразить окно выбора слоёв. Используются все слои.\nПричина: {}".format(e)
+                u"- Слой {idx}: **{mat}** — {width} мм, {func}{badge}".format(
+                    idx=layer['index'],
+                    mat=layer['material_name'],
+                    width=layer['width_mm'],
+                    func=describe_layer_function(layer['function']),
+                    badge=badge,
+                )
             )
-            return layers_info
 
-        if dialog_result is None:
-            return None
+    def _report_parts(self, part_ids, layers):
+        """Опубликовать список полученных частей."""
+        if not part_ids:
+            output.print_md(u"⚠️ Для стены не найдено частей.")
+            return
+
+        output.print_md(u"### Созданные части:")
+
+        if layers and len(layers) == len(part_ids):
+            for layer, part_id in zip(layers, part_ids):
+                part = self.doc.GetElement(part_id)
+                part_name = get_element_name(part, default=u"Часть")
+                output.print_md(
+                    u"- Слой {idx} → часть `{name}` (ID {pid}, {width} мм)".format(
+                        idx=layer['index'],
+                        name=part_name,
+                        pid=part_id.IntegerValue,
+                        width=layer['width_mm'],
+                    )
+                )
+        else:
+            for index, part_id in enumerate(part_ids, 1):
+                part = self.doc.GetElement(part_id)
+                part_name = get_element_name(part, default=u"Часть")
+                output.print_md(
+                    u"- Часть {idx}: `{name}` (ID {pid})".format(
+                        idx=index,
+                        name=part_name,
+                        pid=part_id.IntegerValue,
+                    )
+                )
+
+        output.print_md(u"### Что дальше")
+        output.print_md(u"- При необходимости используйте инструмент **Divide Parts**, чтобы дополнительно нарезать части по эскизам или уровням.")
+        output.print_md(u"- Для отображения исходной стены вместе с частями переключите вид на режим *Show Parts and Original*.")
+        output.print_md(u"- Части находятся в отдельной категории, поэтому для спецификаций и фильтров используйте таблицы Parts.")
+
+    # ------------------------------- рабочий процесс -------------------------------
+    def select_wall(self):
+        """Запрашивает у пользователя выбор многослойной стены."""
+        try:
+            reference = self.uidoc.Selection.PickObject(
+                ObjectType.Element,
+                u"Выберите составную стену для создания частей"
+            )
+        except Exception as exc:
+            forms.alert(u"Стена не выбрана. Причина: {}".format(exc), exitscript=True)
+            return False
+
+        wall = self.doc.GetElement(reference.ElementId)
+        if not isinstance(wall, Wall):
+            forms.alert(u"Выбранный элемент не является стеной.", exitscript=True)
+            return False
+
+        self.wall = wall
+        self.wall_type = wall.WallType if hasattr(wall, 'WallType') else None
+
+        if isinstance(self.wall_type, WallType):
+            try:
+                self.compound_structure = self.wall_type.GetCompoundStructure()
+            except Exception:
+                self.compound_structure = None
+        else:
+            self.compound_structure = None
+
+        if not self.compound_structure or self.compound_structure.LayerCount < 2:
+            forms.alert(
+                u"Стена не имеет многослойной структуры. Штатные Parts для неё создать нельзя.",
+                exitscript=True
+            )
+            return False
+
+        return True
+
+    def _create_parts(self):
+        """Создаёт части для выбранной стены."""
+        if not self.wall:
+            return []
+
+        wall_id = self.wall.Id
 
         try:
-            user_confirmed = bool(dialog_result)
+            if not PartUtils.IsElementValidForCreateParts(self.doc, wall_id):
+                forms.alert(
+                    u"Элемент нельзя превратить в Parts. Проверьте, не является ли стена вложенной в группу или ссылку.",
+                    exitscript=True
+                )
+                return []
         except Exception:
-            user_confirmed = False
+            pass
 
-        if user_confirmed:
-            selected = window.get_selected_layers()
-            if selected:
-                return selected
-            return None
+        element_ids = List[ElementId]()
+        element_ids.Add(wall_id)
 
-        return None
+        PartUtils.CreateParts(self.doc, element_ids)
+        return self._get_existing_parts()
 
     def execute(self):
-        """Основной метод выполнения"""
-
-        # 1. Выбор стены
+        """Запускает пайплайн."""
         if not self.select_wall():
             return
 
-        wall_type_name = self.get_element_name(self.wall_type)
-        output.print_md("## Разбивка стены: **{}**".format(wall_type_name))
+        wall_name = get_element_name(self.wall_type, default=u"Стена")
+        output.print_md(u"## Разбивка стены **{}** на Parts".format(wall_name))
 
-        # 2. Получение информации о слоях
-        layers_info = self.get_wall_info()
+        layers = self._collect_layers()
+        self._report_layers(layers)
 
-        # Отбрасываем слои с нулевой толщиной, так как их невозможно превратить в отдельную стену
-        positive_layers = []
-        skipped_layers = []
-        for layer in layers_info:
-            if layer.get('width', 0.0) and layer['width'] > 1e-6:
-                positive_layers.append(layer)
-            else:
-                skipped_layers.append(layer)
-
-        if skipped_layers:
-            output.print_md("⚠️ Пропущены слои с нулевой толщиной:")
-            for layer in skipped_layers:
-                output.print_md("- {}".format(layer.get('material_name', u"Слой {}".format(layer.get('index', 0) + 1))))
-
-        layers_info = positive_layers
-
-        if not layers_info:
-            forms.alert(u"У выбранной стены отсутствуют слои с ненулевой толщиной.", exitscript=True)
-            return
-
-        output.print_md("### Найдено слоёв: **{}**".format(len(layers_info)))
-        for layer in layers_info:
-            output.print_md("- **{}**: {} мм".format(
-                layer['material_name'],
-                layer['width_mm']
-            ))
-
-        base_name = sanitize_name(wall_type_name) or "Стена"
-
-        # 3. Открытие окна выбора слоёв
-        selected_layers = self.show_layer_selection_dialog(layers_info, base_name)
-        if selected_layers is None:
-            output.print_md("⚠️ Разбивка отменена пользователем.")
-            return
-
-        layers_info = selected_layers
-
-        output.print_md("### К обработке выбрано слоёв: **{}**".format(len(layers_info)))
-        for layer in layers_info:
-            custom_name = layer.get('custom_type_name')
-            if not custom_name:
-                custom_name = generate_default_type_name(
-                    base_name,
-                    layer.get('material_name'),
-                    layer.get('width_mm'),
-                    layer.get('index', 0)
+        existing_parts = self._get_existing_parts()
+        if existing_parts:
+            output.print_md(
+                u"⚠️ Для стены уже созданы части ({} шт.). Скрипт переключит вид и покажет информацию.".format(
+                    len(existing_parts)
                 )
-            output.print_md("- **{}** → новый тип: `{}`".format(
-                layer['material_name'],
-                custom_name
-            ))
+            )
 
-        # 4. Получение вложенных элементов
-        self.hosted_elements = self.get_hosted_elements()
-        if self.hosted_elements:
-            output.print_md("### Найдено вложенных элементов: **{}**".format(
-                len(self.hosted_elements)
-            ))
+            with revit.Transaction(u"Актуализация вида (Parts)"):
+                self._ensure_view_ready()
 
-        # Запрос подтверждения
+            self._report_parts(existing_parts, layers)
+            return
+
         if not forms.alert(
-                "Разбить стену на {} отдельных слоёв?".format(len(layers_info)),
-                yes=True, no=True
+                u"Создать части (Parts) для всех {} слоёв?".format(len(layers)),
+                yes=True,
+                no=True
         ):
+            output.print_md(u"⚠️ Операция отменена пользователем.")
             return
 
-        # 5. Начинаем транзакцию
-        with revit.Transaction("Разбивка стены на слои"):
+        with revit.Transaction(u"Создание Parts из стены"):
+            self._ensure_view_ready()
+            part_ids = self._create_parts()
 
-            # 6. Создаём новые типы стен
-            output.print_md("### Создание новых типов стен...")
-            new_wall_types = []
+        if not part_ids:
+            output.print_md(u"⚠️ Части не были созданы. Проверьте журнал выше.")
+            return
 
-            for layer in layers_info:
-                new_type = self.create_single_layer_wall_type(layer, base_name)
-                new_wall_types.append(new_type)
-                layer['new_type'] = new_type
-
-            # 7. Рассчитываем позиции новых стен
-            positions = self.calculate_wall_positions(layers_info)
-
-            # 8. Создаём новые стены
-            output.print_md("### Создание новых стен...")
-            for pos_data in positions:
-                new_wall = Wall.Create(
-                    doc,
-                    pos_data['curve'],
-                    pos_data['layer']['new_type'].Id,
-                    self.original_wall.LevelId,
-                    self.get_creation_height(),
-                    0,  # offset
-                    self.original_wall.Flipped,
-                    False  # structural
-                )
-
-                # Копируем параметры
-                self.copy_parameters(self.original_wall, new_wall)
-
-                self.new_walls.append(new_wall)
-
-                output.print_md("✓ Создана стена: **{}**".format(
-                    self.get_element_name(pos_data['layer']['new_type'])
-                ))
-
-            # 9. Переносим вложенные элементы на ближайшую новую стену
-            if self.hosted_elements and self.new_walls:
-                output.print_md("### Перенос вложенных элементов...")
-
-                def _wall_width(target_wall):
-                    try:
-                        structure = target_wall.WallType.GetCompoundStructure()
-                        if structure and structure.LayerCount:
-                            return structure.GetLayerWidth(0)
-                    except Exception:
-                        pass
-
-                    try:
-                        width_param = target_wall.WallType.get_Parameter(
-                            BuiltInParameter.WALL_ATTR_WIDTH_PARAM
-                        )
-                        if width_param and width_param.HasValue:
-                            return width_param.AsDouble()
-                    except Exception:
-                        pass
-
-                    return 0
-
-                # Находим стену с максимальной толщиной (обычно несущая)
-                main_wall = max(self.new_walls, key=_wall_width)
-
-                for element in self.hosted_elements:
-                    try:
-                        element.Host = main_wall
-                        output.print_md("✓ Перенесён элемент: **{}**".format(
-                            self.get_element_name(element)
-                        ))
-                    except Exception as e:
-                        output.print_md("✗ Ошибка переноса: {}".format(str(e)))
-
-            # 10. Соединяем новые стены между собой
-            output.print_md("### Соединение стен...")
-            for i, wall1 in enumerate(self.new_walls):
-                for wall2 in self.new_walls[i + 1:]:
-                    try:
-                        JoinGeometryUtils.JoinGeometry(doc, wall1, wall2)
-                    except:
-                        pass  # Игнорируем ошибки соединения
-
-            # 11. Удаляем исходную стену
-            doc.Delete(self.original_wall.Id)
-            output.print_md("### ✓ Исходная стена удалена")
-
-        output.print_md("## ✅ Разбивка завершена успешно!")
-        output.print_md("Создано стен: **{}**".format(len(self.new_walls)))
+        output.print_md(u"## ✅ Стена преобразована в Parts")
+        self._report_parts(part_ids, layers)
 
 
-# Запуск
 if __name__ == '__main__':
-    separator = WallLayerSeparator()
-    separator.execute()
+    pipeline = CompositeWallPartsPipeline()
+    pipeline.execute()
