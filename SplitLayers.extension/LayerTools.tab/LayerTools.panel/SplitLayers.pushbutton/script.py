@@ -163,9 +163,84 @@ class WallLayerSeparator:
         self.uidoc = uidoc
         self.original_wall = None
         self.wall_type = None
+        self.wall_kind = None
+        self.is_stacked = False
+        self.structure_source_type = None
         self.compound_structure = None
         self.new_walls = []
         self.hosted_elements = []
+        self.stacked_member_types = []
+
+    def _initialize_stacked_wall_data(self):
+        """Попытка получить структуру слоёв из сегментов составной стены."""
+
+        self.stacked_member_types = []
+
+        try:
+            member_ids = StackedWallUtils.GetMemberIds(self.original_wall)
+        except Exception as e:
+            output.print_md(
+                u"⚠️ Не удалось получить сегменты составной стены: {}".format(e)
+            )
+            return
+
+        if not member_ids:
+            output.print_md(
+                u"⚠️ API вернул пустой список сегментов для составной стены."
+            )
+            return
+
+        seen_type_ids = set()
+
+        for member_id in member_ids:
+            try:
+                member_wall = doc.GetElement(member_id)
+            except Exception:
+                member_wall = None
+
+            if not isinstance(member_wall, Wall):
+                continue
+
+            member_type = member_wall.WallType
+            if not isinstance(member_type, WallType):
+                continue
+
+            type_id_value = member_type.Id.IntegerValue
+            if type_id_value in seen_type_ids:
+                continue
+
+            seen_type_ids.add(type_id_value)
+            self.stacked_member_types.append(member_type)
+
+            if (self.structure_source_type is None or
+                    (self.structure_source_type and self.structure_source_type.Id == self.wall_type.Id)):
+                self.structure_source_type = member_type
+
+            if not self.compound_structure:
+                try:
+                    struct = member_type.GetCompoundStructure()
+                except Exception:
+                    struct = None
+
+                if struct and getattr(struct, 'LayerCount', 0) > 0:
+                    self.compound_structure = struct
+                    self.structure_source_type = member_type
+
+        if self.stacked_member_types:
+            output.print_md("### Сегменты составной стены:")
+            for member_type in self.stacked_member_types:
+                output.print_md("- {}".format(self.get_element_name(member_type)))
+
+        if self.compound_structure and self.structure_source_type:
+            output.print_md(
+                u"ℹ️ Обнаружена составная (stacked) стена. Структура слоёв взята из сегмента типа `{}`.".format(
+                    self.get_element_name(self.structure_source_type)
+                )
+            )
+        elif self.stacked_member_types:
+            output.print_md(
+                u"⚠️ Сегменты составной стены получены, но их структура слоёв недоступна. Будет использован упрощённый расчёт ширины."
+            )
 
     def get_element_name(self, element, default="Без имени"):
         """Безопасное получение имени элемента Revit"""
@@ -217,6 +292,10 @@ class WallLayerSeparator:
                 return False
 
             self.wall_type = self.original_wall.WallType
+            self.wall_kind = getattr(self.wall_type, 'Kind', None)
+            self.is_stacked = self.wall_kind == WallKind.Stacked if self.wall_kind is not None else False
+            self.structure_source_type = self.wall_type
+            self.stacked_member_types = []
 
             # Пробуем получить структуру разными способами
             self.compound_structure = None
@@ -224,6 +303,8 @@ class WallLayerSeparator:
             # Способ 1: напрямую от типа
             try:
                 self.compound_structure = self.wall_type.GetCompoundStructure()
+                if self.compound_structure:
+                    self.structure_source_type = self.wall_type
             except:
                 pass
 
@@ -239,6 +320,8 @@ class WallLayerSeparator:
                             struct_elem = doc.GetElement(struct_id)
                             if hasattr(struct_elem, 'GetCompoundStructure'):
                                 self.compound_structure = struct_elem.GetCompoundStructure()
+                                if self.compound_structure:
+                                    self.structure_source_type = self.wall_type
                 except:
                     pass
 
@@ -271,6 +354,9 @@ class WallLayerSeparator:
                 except:
                     pass
 
+            if self.is_stacked:
+                self._initialize_stacked_wall_data()
+
             # Проверяем на наличие редактированного профиля
             if not self.compound_structure:
                 # Проверка на модифицированную геометрию
@@ -295,33 +381,38 @@ class WallLayerSeparator:
                     output.print_md("⚠️ **Стена имеет редактируемый профиль**")
 
             if not self.compound_structure:
-                # Выводим отладочную информацию
-                output.print_md("### Отладочная информация:")
-                output.print_md("- Имя типа: **{}**".format(self.get_element_name(self.wall_type)))
-                output.print_md("- ID типа: **{}**".format(self.wall_type.Id))
-                output.print_md("- Тип стены (Kind): **{}**".format(self.wall_type.Kind))
+                if self.is_stacked:
+                    output.print_md(
+                        u"⚠️ Структура слоёв составной стены недоступна. Разбивка будет выполнена на основе общей толщины."
+                    )
+                else:
+                    # Выводим отладочную информацию
+                    output.print_md("### Отладочная информация:")
+                    output.print_md("- Имя типа: **{}**".format(self.get_element_name(self.wall_type)))
+                    output.print_md("- ID типа: **{}**".format(self.wall_type.Id))
+                    output.print_md("- Тип стены (Kind): **{}**".format(self.wall_type.Kind))
 
-                # Проверяем все параметры типа
-                params_info = []
-                for param in self.wall_type.Parameters:
-                    if param.HasValue:
-                        try:
-                            value = param.AsValueString() or str(param.AsElementId().IntegerValue)
-                            params_info.append("{}: {}".format(param.Definition.Name, value))
-                        except:
-                            pass
+                    # Проверяем все параметры типа
+                    params_info = []
+                    for param in self.wall_type.Parameters:
+                        if param.HasValue:
+                            try:
+                                value = param.AsValueString() or str(param.AsElementId().IntegerValue)
+                                params_info.append("{}: {}".format(param.Definition.Name, value))
+                            except:
+                                pass
 
-                if params_info:
-                    output.print_md("### Параметры типа стены:")
-                    for info in params_info[:10]:  # Первые 10 параметров
-                        output.print_md("- {}".format(info))
+                    if params_info:
+                        output.print_md("### Параметры типа стены:")
+                        for info in params_info[:10]:  # Первые 10 параметров
+                            output.print_md("- {}".format(info))
 
-                forms.alert(
-                    "Стена не имеет многослойной структуры!\n\nВозможные причины:\n1. Это не составная стена\n2. Стена имеет модификации\n3. Используется сложный профиль",
-                    exitscript=True)
-                return False
+                    forms.alert(
+                        "Стена не имеет многослойной структуры!\n\nВозможные причины:\n1. Это не составная стена\n2. Стена имеет модификации\n3. Используется сложный профиль",
+                        exitscript=True)
+                    return False
 
-            if self.compound_structure.LayerCount < 2:
+            if self.compound_structure and self.compound_structure.LayerCount < 2:
                 forms.alert("Стена имеет только {} слой!\nДля разбивки нужно минимум 2 слоя.".format(
                     self.compound_structure.LayerCount
                 ), exitscript=True)
@@ -361,12 +452,13 @@ class WallLayerSeparator:
             output.print_md("⚠️ Используется альтернативный метод получения слоёв")
 
             # Получаем общую толщину
-            width_param = self.wall_type.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM)
+            source_type = self.structure_source_type or self.wall_type
+            width_param = source_type.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM) if source_type else None
             if width_param:
                 total_width = width_param.AsDouble()
 
                 # Создаём псевдо-слой
-                material_param = self.wall_type.get_Parameter(BuiltInParameter.STRUCTURAL_MATERIAL_PARAM)
+                material_param = source_type.get_Parameter(BuiltInParameter.STRUCTURAL_MATERIAL_PARAM) if source_type else None
                 material_id = material_param.AsElementId() if material_param else ElementId.InvalidElementId
                 material = doc.GetElement(material_id) if material_id != ElementId.InvalidElementId else None
 
@@ -444,7 +536,16 @@ class WallLayerSeparator:
             return existing
 
         # Создаём новый тип
-        new_wall_type = self.wall_type.Duplicate(new_name)
+        source_type = self.structure_source_type or self.wall_type
+        if source_type is None:
+            source_type = self.wall_type
+
+        if source_type is None:
+            raise Exception("Не удалось определить исходный тип стены для дублирования")
+
+        new_wall_type = source_type.Duplicate(new_name)
+        if isinstance(new_wall_type, ElementId):
+            new_wall_type = doc.GetElement(new_wall_type)
 
         # Создаём структуру с одним слоем
         try:
