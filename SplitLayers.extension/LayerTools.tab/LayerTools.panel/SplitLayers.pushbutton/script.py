@@ -89,6 +89,8 @@ def get_element_name(element, default=u"Без имени"):
         return default
 
 
+_DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
+
 _LAYER_FUNCTION_MAP = {
     MaterialFunctionAssignment.Structure: u"Несущий слой",
     MaterialFunctionAssignment.Substrate: u"Основание",
@@ -96,13 +98,119 @@ _LAYER_FUNCTION_MAP = {
     MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
     MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
     MaterialFunctionAssignment.Membrane: u"Мембрана",
-    MaterialFunctionAssignment.Other: u"Прочий слой",
 }
+
+if _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
+    _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
 
 
 def describe_layer_function(layer_function):
     """Текстовое описание функции слоя."""
     return _LAYER_FUNCTION_MAP.get(layer_function, unicode(layer_function))
+
+
+def _resolve_compound_structure(wall):
+    """Пытается извлечь CompoundStructure из стены или её типа."""
+
+    if not wall:
+        return None
+
+    candidates = []
+
+    try:
+        candidates.append(wall)
+    except Exception:
+        pass
+
+    try:
+        wall_type = wall.WallType
+    except (AttributeError, MissingMemberException):
+        wall_type = None
+    except Exception:
+        wall_type = None
+
+    if wall_type and wall_type not in candidates:
+        candidates.append(wall_type)
+
+    doc = getattr(wall, 'Document', None)
+    if doc:
+        try:
+            type_element = doc.GetElement(wall.GetTypeId())
+        except Exception:
+            type_element = None
+        if type_element and type_element not in candidates:
+            candidates.append(type_element)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        for accessor in ('GetCompoundStructure', 'get_CompoundStructure'):
+            try:
+                method = getattr(candidate, accessor)
+            except (AttributeError, MissingMemberException):
+                method = None
+            except Exception:
+                method = None
+
+            if callable(method):
+                try:
+                    structure = method()
+                except Exception:
+                    structure = None
+                if structure:
+                    return structure
+
+        try:
+            structure = getattr(candidate, 'CompoundStructure')
+        except (AttributeError, MissingMemberException):
+            structure = None
+        except Exception:
+            structure = None
+
+        if structure:
+            return structure
+
+    return None
+
+
+def _get_layer_count(structure):
+    """Безопасно определяет количество слоёв в CompoundStructure."""
+
+    if not structure:
+        return 0
+
+    try:
+        layer_count = int(structure.LayerCount)
+        if layer_count > 0:
+            return layer_count
+    except (AttributeError, MissingMemberException, TypeError, ValueError):
+        pass
+    except Exception:
+        pass
+
+    try:
+        layers = structure.GetLayers()
+    except (AttributeError, MissingMemberException):
+        layers = None
+    except Exception:
+        layers = None
+
+    if layers is None:
+        return 0
+
+    try:
+        return len(layers)
+    except TypeError:
+        count = 0
+        try:
+            for _ in layers:
+                count += 1
+        except Exception:
+            return 0
+        return count
+    except Exception:
+        return 0
 
 
 class CompositeWallPartsPipeline(object):
@@ -115,6 +223,7 @@ class CompositeWallPartsPipeline(object):
         self.wall = None
         self.wall_type = None
         self.compound_structure = None
+        self.layer_count = 0
 
     # ---------------------------- служебные методы ----------------------------
     def _ensure_view_ready(self):
@@ -182,21 +291,85 @@ class CompositeWallPartsPipeline(object):
         if not structure:
             return layers
 
-        for index in range(structure.LayerCount):
-            try:
-                width = structure.GetLayerWidth(index)
-            except Exception:
-                width = 0.0
+        enumerated_layers = []
 
-            try:
-                function = structure.GetLayerFunction(index)
-            except Exception:
-                function = MaterialFunctionAssignment.Other
+        try:
+            raw_layers = structure.GetLayers()
+        except (AttributeError, MissingMemberException):
+            raw_layers = None
+        except Exception:
+            raw_layers = None
 
+        if raw_layers is not None:
             try:
-                material_id = structure.GetMaterialId(index)
+                iterator = iter(raw_layers)
+            except TypeError:
+                iterator = None
             except Exception:
-                material_id = ElementId.InvalidElementId
+                iterator = None
+
+            if iterator is not None:
+                try:
+                    for idx, layer_obj in enumerate(raw_layers):
+                        enumerated_layers.append((idx, layer_obj))
+                except Exception:
+                    enumerated_layers = []
+
+        if not enumerated_layers:
+            layer_count = _get_layer_count(structure)
+            for index in range(layer_count):
+                enumerated_layers.append((index, None))
+
+        for index, layer_obj in enumerated_layers:
+            width = None
+            function = None
+            material_id = None
+            is_core = False
+
+            if layer_obj is not None:
+                try:
+                    width = layer_obj.Width
+                except Exception:
+                    width = None
+
+                try:
+                    function = layer_obj.Function
+                except Exception:
+                    function = None
+
+                try:
+                    material_id = layer_obj.MaterialId
+                except Exception:
+                    material_id = None
+
+                try:
+                    is_core = bool(layer_obj.IsCore)
+                except Exception:
+                    is_core = False
+
+            if width is None:
+                try:
+                    width = structure.GetLayerWidth(index)
+                except Exception:
+                    width = 0.0
+
+            if function is None:
+                try:
+                    function = structure.GetLayerFunction(index)
+                except Exception:
+                    function = _DEFAULT_LAYER_FUNCTION
+
+            if material_id is None:
+                try:
+                    material_id = structure.GetMaterialId(index)
+                except Exception:
+                    material_id = ElementId.InvalidElementId
+
+            if not is_core:
+                try:
+                    is_core = structure.IsCoreLayer(index)
+                except Exception:
+                    is_core = False
 
             material = self.doc.GetElement(material_id) if material_id else None
 
@@ -208,8 +381,10 @@ class CompositeWallPartsPipeline(object):
                 'material_id': material_id,
                 'material_name': get_element_name(material, default=u"Без материала"),
                 'function': function,
-                'is_core': structure.IsCoreLayer(index) if hasattr(structure, 'IsCoreLayer') else False,
+                'is_core': bool(is_core),
             })
+
+        self.layer_count = max(self.layer_count, len(layers))
 
         return layers
 
@@ -287,19 +462,37 @@ class CompositeWallPartsPipeline(object):
             return False
 
         self.wall = wall
-        self.wall_type = wall.WallType if hasattr(wall, 'WallType') else None
+        self.wall_type = None
 
-        if isinstance(self.wall_type, WallType):
+        if hasattr(wall, 'WallType'):
             try:
-                self.compound_structure = self.wall_type.GetCompoundStructure()
+                candidate_type = wall.WallType
+            except (AttributeError, MissingMemberException):
+                candidate_type = None
             except Exception:
-                self.compound_structure = None
-        else:
-            self.compound_structure = None
+                candidate_type = None
 
-        if not self.compound_structure or self.compound_structure.LayerCount < 2:
+            if isinstance(candidate_type, WallType):
+                self.wall_type = candidate_type
+
+        if not isinstance(self.wall_type, WallType):
+            try:
+                type_element = self.doc.GetElement(wall.GetTypeId())
+            except Exception:
+                type_element = None
+
+            if isinstance(type_element, WallType):
+                self.wall_type = type_element
+
+        self.compound_structure = _resolve_compound_structure(wall)
+        self.layer_count = _get_layer_count(self.compound_structure)
+
+        if self.layer_count < 1:
             forms.alert(
-                u"Стена не имеет многослойной структуры. Штатные Parts для неё создать нельзя.",
+                u"Стена не имеет многослойной структуры. Штатные Parts для неё создать нельзя.\n"
+                u"Получено количество слоёв: {}. Убедитесь, что выбран тип Basic Wall и у него заданы слои.".format(
+                    self.layer_count
+                ),
                 exitscript=True
             )
             return False
@@ -338,6 +531,9 @@ class CompositeWallPartsPipeline(object):
         output.print_md(u"## Разбивка стены **{}** на Parts".format(wall_name))
 
         layers = self._collect_layers()
+        output.print_md(
+            u"ℹ️ В типе обнаружено {} слоёв. Ниже приведены подробности по каждому.".format(len(layers))
+        )
         self._report_layers(layers)
 
         existing_parts = self._get_existing_parts()
