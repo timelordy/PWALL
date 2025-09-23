@@ -20,6 +20,22 @@ from Autodesk.Revit.UI import *
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.DB.Structure import *
 
+# В разных версиях Revit класс StackedWallUtils может находиться в разных
+# пространствах имён или отсутствовать вовсе. Выполняем безопасное
+# определение переменной, чтобы использовать класс, когда он доступен, и
+# корректно обрабатывать случаи, когда API не предоставляет данный класс.
+StackedWallUtils = None
+
+try:
+    from Autodesk.Revit.DB import StackedWallUtils as _StackedWallUtils
+    StackedWallUtils = _StackedWallUtils
+except Exception:
+    try:
+        from Autodesk.Revit.DB.Structure import StackedWallUtils as _StackedWallUtils
+        StackedWallUtils = _StackedWallUtils
+    except Exception:
+        StackedWallUtils = None
+
 # Импорт PyRevit
 from pyrevit import revit, DB, UI
 from pyrevit import forms
@@ -175,6 +191,12 @@ class WallLayerSeparator:
         """Попытка получить структуру слоёв из сегментов составной стены."""
 
         self.stacked_member_types = []
+
+        if StackedWallUtils is None:
+            output.print_md(
+                u"⚠️ Класс `StackedWallUtils` недоступен в текущей версии Revit API."
+            )
+            return
 
         try:
             member_ids = StackedWallUtils.GetMemberIds(self.original_wall)
