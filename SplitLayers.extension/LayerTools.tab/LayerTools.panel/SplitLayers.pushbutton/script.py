@@ -399,15 +399,44 @@ class WallLayerSeparator:
     def copy_parameters(self, from_wall, to_wall):
         """Копирование параметров со старой стены на новую"""
 
-        # Список параметров для копирования
-        params_to_copy = [
-            BuiltInParameter.WALL_BASE_CONSTRAINT,
-            BuiltInParameter.WALL_BASE_OFFSET,
-            BuiltInParameter.WALL_HEIGHT_TYPE,
-            BuiltInParameter.WALL_TOP_CONSTRAINT,
-            BuiltInParameter.WALL_TOP_OFFSET,
-            BuiltInParameter.WALL_USER_HEIGHT_PARAM
+        # Список параметров для копирования. Для каждого имени указаны варианты,
+        # которые встречаются в разных версиях Revit API. Это защищает код от
+        # AttributeError при отсутствии конкретного перечислителя.
+        param_name_map = [
+            ("WALL_BASE_CONSTRAINT", "WALL_BASE_CONSTRAINT_PARAM"),
+            ("WALL_BASE_OFFSET", "WALL_BASE_OFFSET_PARAM"),
+            ("WALL_HEIGHT_TYPE", "WALL_TOP_CONSTRAINT", "WALL_TOP_CONSTRAINT_PARAM"),
+            ("WALL_TOP_CONSTRAINT", "WALL_TOP_CONSTRAINT_PARAM", "WALL_HEIGHT_TYPE"),
+            ("WALL_TOP_OFFSET", "WALL_TOP_OFFSET_PARAM"),
+            ("WALL_USER_HEIGHT_PARAM", "WALL_USER_HEIGHT")
         ]
+
+        params_to_copy = []
+        resolved_params = set()
+
+        for names in param_name_map:
+            if isinstance(names, str):
+                candidates = (names,)
+            else:
+                candidates = names
+
+            resolved_param = None
+            for name in candidates:
+                param_id = getattr(BuiltInParameter, name, None)
+                if param_id is not None:
+                    resolved_param = param_id
+                    if param_id not in resolved_params:
+                        params_to_copy.append(param_id)
+                        resolved_params.add(param_id)
+                    break
+
+            if resolved_param is None:
+                try:
+                    output.print_md(
+                        u"⚠️ Параметр `{}` недоступен в данной версии API".format(candidates[0])
+                    )
+                except Exception:
+                    pass
 
         for param_id in params_to_copy:
             try:
