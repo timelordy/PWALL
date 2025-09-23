@@ -10,6 +10,7 @@ __author__ = 'Wall Layers Separator'
 import clr
 import sys
 import math
+from System import MissingMemberException
 
 # Импорт Revit API
 clr.AddReference('RevitAPI')
@@ -40,17 +41,17 @@ class WallLayerSeparator:
         self.new_walls = []
         self.hosted_elements = []
 
-    def get_element_name(self, element):
+    def get_element_name(self, element, default="Без имени"):
         """Безопасное получение имени элемента Revit"""
         if not element:
-            return "Без имени"
+            return default
 
         # Сначала пытаемся получить свойство Name напрямую
         try:
             name = element.Name
             if name:
                 return name
-        except AttributeError:
+        except (AttributeError, MissingMemberException):
             pass
 
         # Если свойства нет, пробуем получить значение из параметров
@@ -74,7 +75,7 @@ class WallLayerSeparator:
         try:
             return "ID {}".format(element.Id.IntegerValue)
         except Exception:
-            return "Без имени"
+            return default
 
     def select_wall(self):
         """Выбор стены пользователем"""
@@ -218,7 +219,7 @@ class WallLayerSeparator:
                 layer_material_id = self.compound_structure.GetMaterialId(i)
 
                 material = doc.GetElement(layer_material_id) if layer_material_id else None
-                material_name = material.Name if material else "Без материала"
+                material_name = self.get_element_name(material, default="Без материала")
 
                 layers_info.append({
                     'index': i,
@@ -248,7 +249,7 @@ class WallLayerSeparator:
                     'function': MaterialFunctionAssignment.Structure,
                     'width': total_width,
                     'material_id': material_id,
-                    'material_name': material.Name if material else "Основной материал",
+                    'material_name': self.get_element_name(material, default="Основной материал"),
                     'width_mm': round(total_width * 304.8, 1)
                 })
 
@@ -296,7 +297,9 @@ class WallLayerSeparator:
         existing = None
         collector = FilteredElementCollector(doc).OfClass(WallType)
         for wt in collector:
-            if wt.Name == new_name:
+            wt_name_param = wt.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            wt_name = wt_name_param.AsString() if wt_name_param else None
+            if wt_name == new_name:
                 existing = wt
                 break
 
