@@ -21,14 +21,18 @@ from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.DB.Structure import *
 
 # В разных версиях Revit класс StackedWallUtils может находиться в разных
-# пространствах имён или отсутствовать вовсе. Выполняем безопасный импорт,
-# чтобы использовать его, когда он доступен, и корректно обрабатывать случаи,
-# когда API не предоставляет данный класс.
+# пространствах имён или отсутствовать вовсе. Выполняем безопасное
+# определение переменной, чтобы использовать класс, когда он доступен, и
+# корректно обрабатывать случаи, когда API не предоставляет данный класс.
+StackedWallUtils = None
+
 try:
-    from Autodesk.Revit.DB import StackedWallUtils
+    from Autodesk.Revit.DB import StackedWallUtils as _StackedWallUtils
+    StackedWallUtils = _StackedWallUtils
 except Exception:
     try:
-        from Autodesk.Revit.DB.Structure import StackedWallUtils
+        from Autodesk.Revit.DB.Structure import StackedWallUtils as _StackedWallUtils
+        StackedWallUtils = _StackedWallUtils
     except Exception:
         StackedWallUtils = None
 
