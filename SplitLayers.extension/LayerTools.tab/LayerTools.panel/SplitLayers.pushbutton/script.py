@@ -31,6 +31,11 @@ from Autodesk.Revit.DB import (
 )
 from Autodesk.Revit.UI.Selection import ObjectType
 
+try:
+    from Autodesk.Revit.Exceptions import ArgumentException as RevitArgumentException
+except ImportError:
+    RevitArgumentException = Exception
+
 # Импорт PyRevit
 def _load_pyrevit_modules():
     from pyrevit import revit, forms, script
@@ -603,6 +608,95 @@ def _structure_to_layer_info(structure, doc, index_offset=0):
     return layers
 
 
+def _format_layer_part_name(layer):
+    """Формирует подпись слоя для использования как имя части."""
+    if not layer:
+        return None
+
+    try:
+        index = int(layer.get('index')) if layer.get('index') is not None else None
+    except Exception:
+        index = None
+
+    name_bits = []
+    if index:
+        name_bits.append(u"Слой {}".format(index))
+
+    segment_index = layer.get('segment_index')
+    segment_layer_index = layer.get('segment_layer_index')
+    segment_name = layer.get('segment_name')
+    segment_chunks = []
+    if segment_index:
+        segment_chunks.append(u"Сегмент {}".format(segment_index))
+    if segment_layer_index:
+        segment_chunks.append(u"Слой внутри сегмента {}".format(segment_layer_index))
+    if segment_name:
+        segment_chunks.append(segment_name)
+    if segment_chunks:
+        name_bits.append(u" / ".join(segment_chunks))
+
+    if not name_bits:
+        name_bits.append(u"Слой")
+
+    label = u" / ".join(name_bits)
+
+    description_parts = []
+    material_name = layer.get('material_name')
+    if material_name:
+        description_parts.append(material_name)
+
+    width_mm = layer.get('width_mm')
+    if width_mm is not None:
+        try:
+            description_parts.append(u"{:.1f} мм".format(float(width_mm)))
+        except Exception:
+            pass
+
+    func_label = describe_layer_function(layer.get('function'))
+    if func_label:
+        description_parts.append(func_label)
+
+    if layer.get('is_core'):
+        description_parts.append(u"Сердцевина")
+
+    if description_parts:
+        return u"{} - {}".format(label, u", ".join(description_parts))
+    return label
+
+
+def _set_part_name(part, value):
+    """Записывает строку в параметр имени части."""
+    if not part or value in (None, ''):
+        return False
+
+    try:
+        text_value = unicode(value)
+    except Exception:
+        try:
+            text_value = str(value)
+        except Exception:
+            return False
+
+    param = None
+    try:
+        param = part.get_Parameter(BuiltInParameter.DPART_PART_NAME)
+    except Exception:
+        param = None
+
+    if param and not getattr(param, 'IsReadOnly', True):
+        try:
+            param.Set(text_value)
+            return True
+        except Exception:
+            pass
+
+    try:
+        part.Name = text_value
+        return True
+    except Exception:
+        return False
+
+
 class CompositeWallPartsPipeline(object):
     """Реализует пайплайн: подготовка вида → создание Parts → отчёт."""
 
@@ -794,6 +888,39 @@ class CompositeWallPartsPipeline(object):
 
         return layers
 
+
+    def _rename_parts(self, part_ids, layers):
+        """Присваивает частям имена, основанные на данных слоёв."""
+        if not part_ids:
+            return 0
+
+        if not layers:
+            iterable = ((part_id, None) for part_id in part_ids)
+        elif len(layers) == len(part_ids):
+            iterable = zip(part_ids, layers)
+        else:
+            iterable = zip(part_ids, layers)
+
+        renamed = 0
+        for part_id, layer in iterable:
+            try:
+                part = self.doc.GetElement(part_id)
+            except Exception:
+                part = None
+
+            if part is None:
+                continue
+
+            display_name = _format_layer_part_name(layer) if layer else None
+            if not display_name:
+                continue
+
+            if _set_part_name(part, display_name):
+                renamed += 1
+
+        return renamed
+
+
     def _report_layers(self, layers):
         """Выводит на экран информацию о слоях."""
         if not layers:
@@ -825,7 +952,7 @@ class CompositeWallPartsPipeline(object):
                     mat=layer['material_name'],
                     width=layer['width_mm'],
                     func=describe_layer_function(layer['function']),
-                    badge=badge,
+                    badge=badge, segment_info=segment_info,
                 )
             )
 
@@ -962,8 +1089,26 @@ class CompositeWallPartsPipeline(object):
         element_ids = List[ElementId]()
         element_ids.Add(wall_id)
 
-        PartUtils.CreateParts(self.doc, element_ids)
-        return self._get_existing_parts()
+        try:
+            PartUtils.CreateParts(self.doc, element_ids)
+        except RevitArgumentException as exc:
+            output.print_md(
+                u"[!] Не удалось создать Parts для стены (ID {}). Причина: {}".format(
+                    wall_id.IntegerValue, exc
+                )
+            )
+            return []
+        except Exception as exc:
+            output.print_md(
+                u"[!] Неожиданная ошибка при создании Parts для стены (ID {}): {}".format(
+                    wall_id.IntegerValue, exc
+                )
+            )
+            return []
+
+        part_ids = self._get_existing_parts()
+
+        return part_ids
 
     def execute(self):
         """Запускает пайплайн."""
@@ -994,8 +1139,14 @@ class CompositeWallPartsPipeline(object):
                 )
             )
 
-            with revit.Transaction(u"Актуализация вида (Parts)"):
+            with revit.Transaction(u"Обновление частей (Parts)"):
                 self._ensure_view_ready()
+                renamed = self._rename_parts(existing_parts, layers)
+
+            if renamed:
+                output.print_md(
+                    u"ℹ️ Обновлены имена {} частей в соответствии со слоями.".format(renamed)
+                )
 
             self._report_parts(existing_parts, layers)
             return
@@ -1008,6 +1159,13 @@ class CompositeWallPartsPipeline(object):
             output.print_md(u"⚠️ Операция отменена пользователем.")
             return
 
+        if _is_stacked_wall_kind(self.wall_kind):
+            wall_name = get_element_name(self.wall, default=u"Стена")
+            output.print_md(
+                u"[!] Стена **{}** остаётся составной. Автоматическое создание Parts пропускаю.".format(wall_name)
+            )
+            return
+
         with revit.Transaction(u"Создание Parts из стены"):
             self._ensure_view_ready()
             part_ids = self._create_parts()
@@ -1015,6 +1173,14 @@ class CompositeWallPartsPipeline(object):
         if not part_ids:
             output.print_md(u"⚠️ Части не были созданы. Проверьте журнал выше.")
             return
+
+        with revit.Transaction(u"Переименование Parts по слоям"):
+            renamed = self._rename_parts(part_ids, layers)
+
+        if renamed:
+            output.print_md(
+                u"ℹ️ Частям присвоены имена по слоям ({} элементов).".format(renamed)
+            )
 
         output.print_md(u"## ✅ Стена преобразована в Parts")
         self._report_parts(part_ids, layers)
