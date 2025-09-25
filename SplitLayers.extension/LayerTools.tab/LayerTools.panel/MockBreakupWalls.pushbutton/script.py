@@ -188,13 +188,16 @@ def _compute_normal(curve):
     return normal.Normalize()
 
 
-def _reverse_vector(vector):
+def _negate_vector(vector):
+    """Возвращает вектор, направленный в противоположную сторону."""
+
     if vector is None:
         return XYZ.Zero
+
     try:
-        reversed_vector = vector.Negate()
-        if reversed_vector is not None:
-            return reversed_vector
+        negated = vector.Negate()
+        if negated is not None:
+            return negated
     except Exception:
         pass
 
@@ -207,16 +210,9 @@ def _reverse_vector(vector):
         return XYZ.Zero
 
 
-def _negate_vector(vector):
-    """Совместимое имя для старых версий скрипта.
-
-    Ранее вспомогательная функция называлась ``_negate_vector``. В новых
-    версиях вся логика вынесена в ``_reverse_vector``. Явно вызываем её отсюда,
-    чтобы сторонние вызовы старого имени продолжали корректно работать и не
-    приводили к исключению NameError.
-    """
-
-    return _reverse_vector(vector)
+# Текущий код использует историческое имя ``_reverse_vector``. Сохраняем
+# совместимость, указывая его на новую реализацию.
+_reverse_vector = _negate_vector
 
 
 def _scale_vector(vector, scale):
@@ -542,7 +538,7 @@ def _breakup_wall(wall):
         return
 
     orientation = _ensure_orientation_vector(context, context['curve'])
-    inward = _reverse_vector(orientation)
+    inward = _negate_vector(orientation)
     try:
         inward = inward.Normalize()
     except Exception:
