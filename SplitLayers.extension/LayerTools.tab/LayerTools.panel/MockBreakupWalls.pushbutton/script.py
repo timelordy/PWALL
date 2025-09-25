@@ -207,6 +207,11 @@ def _reverse_vector(vector):
         return XYZ.Zero
 
 
+def _negate_vector(vector):
+    """Совместимость с ранними версиями скрипта."""
+    return _reverse_vector(vector)
+
+
 def _scale_vector(vector, scale):
     if vector is None:
         return XYZ.Zero
