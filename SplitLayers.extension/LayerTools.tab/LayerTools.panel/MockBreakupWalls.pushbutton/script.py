@@ -186,35 +186,7 @@ def _compute_normal(curve):
     if normal.IsZeroLength():
         normal = XYZ.BasisY
     return normal.Normalize()
-
-
-def _negate_vector(vector):
-    """Возвращает вектор, направленный в противоположную сторону."""
-
-    if vector is None:
-        return XYZ.Zero
-
-    try:
-        negated = vector.Negate()
-        if negated is not None:
-            return negated
-    except Exception:
-        pass
-
-    try:
-        x = -getattr(vector, 'X', 0.0)
-        y = -getattr(vector, 'Y', 0.0)
-        z = -getattr(vector, 'Z', 0.0)
-        return XYZ(x, y, z)
-    except Exception:
-        return XYZ.Zero
-
-
-# Текущий код использует историческое имя ``_reverse_vector``. Сохраняем
-# совместимость, указывая его на новую реализацию.
-_reverse_vector = _negate_vector
-
-
+  
 def _scale_vector(vector, scale):
     if vector is None:
         return XYZ.Zero
@@ -538,7 +510,16 @@ def _breakup_wall(wall):
         return
 
     orientation = _ensure_orientation_vector(context, context['curve'])
-    inward = _negate_vector(orientation)
+    if orientation is None:
+        inward = XYZ.Zero
+    else:
+        try:
+            inward = orientation.Multiply(-1.0)
+        except Exception:
+            try:
+                inward = XYZ(-getattr(orientation, 'X', 0.0), -getattr(orientation, 'Y', 0.0), -getattr(orientation, 'Z', 0.0))
+            except Exception:
+                inward = XYZ.Zero
     try:
         inward = inward.Normalize()
     except Exception:
