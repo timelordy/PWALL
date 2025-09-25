@@ -5,6 +5,9 @@ import clr
 
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
+clr.AddReference('System')
+
+from System.Collections.Generic import List
 
 from Autodesk.Revit.DB import (
     BuiltInParameter,
@@ -16,6 +19,7 @@ from Autodesk.Revit.DB import (
     LocationCurve,
     MaterialFunctionAssignment,
     Transform,
+    Transaction,
     UnitTypeId,
     UnitUtils,
     Wall,
@@ -39,6 +43,50 @@ logger = script.get_logger()
 
 _WIDTH_EPS = 1e-6
 _SIGNATURE_CACHE = {}
+
+try:
+    _TEXT_TYPE = unicode
+except NameError:
+    _TEXT_TYPE = str
+
+
+def _to_unicode(value):
+    if value is None:
+        return u''
+    try:
+        return _TEXT_TYPE(value)
+    except Exception:
+        try:
+            return _TEXT_TYPE(str(value))
+        except Exception:
+            return u''
+
+
+def _get_element_name(element):
+    if element is None:
+        return u''
+    for attr in ('Name', 'name'):
+        try:
+            candidate = getattr(element, attr)
+            if callable(candidate):
+                candidate = candidate()
+            if candidate not in (None, ''):
+                return _to_unicode(candidate)
+        except Exception:
+            continue
+    try:
+        param = element.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_NAME)
+        if param:
+            candidate = param.AsString()
+            if candidate:
+                return _to_unicode(candidate)
+    except Exception:
+        pass
+    try:
+        return _to_unicode(element)
+    except Exception:
+        return u''
+
 
 
 def _feet_to_mm(value):
@@ -186,7 +234,26 @@ def _compute_normal(curve):
     if normal.IsZeroLength():
         normal = XYZ.BasisY
     return normal.Normalize()
-  
+
+def _negate_vector(vector):
+    if vector is None:
+        return XYZ.Zero
+    try:
+        inverted = vector.Negate()
+        if inverted is not None:
+            return inverted
+    except Exception:
+        pass
+
+    try:
+        x = -getattr(vector, 'X', 0.0)
+        y = -getattr(vector, 'Y', 0.0)
+        z = -getattr(vector, 'Z', 0.0)
+        return XYZ(x, y, z)
+    except Exception:
+        return XYZ.Zero
+
+
 def _scale_vector(vector, scale):
     if vector is None:
         return XYZ.Zero
@@ -302,10 +369,9 @@ def _clone_wall_type_for_layer(source_type, layer_info):
     width = layer_info['width']
     width_mm = _feet_to_mm(width)
 
-    try:
-        base_name = unicode(source_type.Name)
-    except Exception:
-        base_name = source_type.Name
+    base_name = _get_element_name(source_type)
+    if not base_name:
+        base_name = u"Wall Layer"
 
     base_label = u"{} слой {} {:.1f} мм".format(base_name, layer_info['index'], width_mm)
     name = _sanitize_name(base_label)
@@ -510,16 +576,7 @@ def _breakup_wall(wall):
         return
 
     orientation = _ensure_orientation_vector(context, context['curve'])
-    if orientation is None:
-        inward = XYZ.Zero
-    else:
-        try:
-            inward = orientation.Multiply(-1.0)
-        except Exception:
-            try:
-                inward = XYZ(-getattr(orientation, 'X', 0.0), -getattr(orientation, 'Y', 0.0), -getattr(orientation, 'Z', 0.0))
-            except Exception:
-                inward = XYZ.Zero
+    inward = _negate_vector(orientation)
     try:
         inward = inward.Normalize()
     except Exception:
