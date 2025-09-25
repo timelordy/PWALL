@@ -188,17 +188,21 @@ def _compute_normal(curve):
     return normal.Normalize()
 
 
-def _negate_vector(vector):
+def _reverse_vector(vector):
     if vector is None:
         return XYZ.Zero
     try:
-        negated = vector.Negate()
-        if negated:
-            return negated
+        reversed_vector = vector.Negate()
+        if reversed_vector is not None:
+            return reversed_vector
     except Exception:
         pass
+
     try:
-        return XYZ(-getattr(vector, 'X', 0.0), -getattr(vector, 'Y', 0.0), -getattr(vector, 'Z', 0.0))
+        x = -getattr(vector, 'X', 0.0)
+        y = -getattr(vector, 'Y', 0.0)
+        z = -getattr(vector, 'Z', 0.0)
+        return XYZ(x, y, z)
     except Exception:
         return XYZ.Zero
 
@@ -526,7 +530,7 @@ def _breakup_wall(wall):
         return
 
     orientation = _ensure_orientation_vector(context, context['curve'])
-    inward = _negate_vector(orientation)
+    inward = _reverse_vector(orientation)
     try:
         inward = inward.Normalize()
     except Exception:
