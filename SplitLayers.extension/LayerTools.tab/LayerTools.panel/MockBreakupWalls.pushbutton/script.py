@@ -186,6 +186,7 @@ def _compute_normal(curve):
     if normal.IsZeroLength():
         normal = XYZ.BasisY
     return normal.Normalize()
+  
 def _scale_vector(vector, scale):
     if vector is None:
         return XYZ.Zero
