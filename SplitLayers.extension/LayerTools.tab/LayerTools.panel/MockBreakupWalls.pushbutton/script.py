@@ -186,39 +186,6 @@ def _compute_normal(curve):
     if normal.IsZeroLength():
         normal = XYZ.BasisY
     return normal.Normalize()
-
-
-def _reverse_vector(vector):
-    if vector is None:
-        return XYZ.Zero
-    try:
-        reversed_vector = vector.Negate()
-        if reversed_vector is not None:
-            return reversed_vector
-    except Exception:
-        pass
-
-    try:
-        x = -getattr(vector, 'X', 0.0)
-        y = -getattr(vector, 'Y', 0.0)
-        z = -getattr(vector, 'Z', 0.0)
-        return XYZ(x, y, z)
-    except Exception:
-        return XYZ.Zero
-
-
-def _negate_vector(vector):
-    """Совместимое имя для старых версий скрипта.
-
-    Ранее вспомогательная функция называлась ``_negate_vector``. В новых
-    версиях вся логика вынесена в ``_reverse_vector``. Явно вызываем её отсюда,
-    чтобы сторонние вызовы старого имени продолжали корректно работать и не
-    приводили к исключению NameError.
-    """
-
-    return _reverse_vector(vector)
-
-
 def _scale_vector(vector, scale):
     if vector is None:
         return XYZ.Zero
@@ -542,7 +509,16 @@ def _breakup_wall(wall):
         return
 
     orientation = _ensure_orientation_vector(context, context['curve'])
-    inward = _reverse_vector(orientation)
+    if orientation is None:
+        inward = XYZ.Zero
+    else:
+        try:
+            inward = orientation.Multiply(-1.0)
+        except Exception:
+            try:
+                inward = XYZ(-getattr(orientation, 'X', 0.0), -getattr(orientation, 'Y', 0.0), -getattr(orientation, 'Z', 0.0))
+            except Exception:
+                inward = XYZ.Zero
     try:
         inward = inward.Normalize()
     except Exception:
