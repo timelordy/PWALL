@@ -158,9 +158,31 @@ def _structure_layers_data(structure):
                 candidate = getattr(layer, attr)
             except Exception:
                 candidate = None
-            if candidate and isinstance(candidate, ElementId) and candidate.IntegerValue > 0:
+
+            if (
+                candidate
+                and isinstance(candidate, ElementId)
+                and candidate.IntegerValue > 0
+            ):
                 material_id = candidate
                 break
+
+        if (
+            (material_id is None)
+            or (not isinstance(material_id, ElementId))
+            or material_id.IntegerValue < 1
+        ):
+            try:
+                candidate = structure.GetMaterialId(idx)
+            except Exception:
+                candidate = None
+
+            if (
+                candidate
+                and isinstance(candidate, ElementId)
+                and candidate.IntegerValue > 0
+            ):
+                material_id = candidate
 
         try:
             function = layer.Function
