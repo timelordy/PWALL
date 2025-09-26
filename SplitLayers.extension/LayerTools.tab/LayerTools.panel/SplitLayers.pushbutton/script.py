@@ -697,6 +697,40 @@ def _set_part_name(part, value):
         return False
 
 
+def _set_part_material(part, material_id):
+    """Присваивает материал части по ElementId слоя."""
+
+    if not part or material_id in (None, '', ElementId.InvalidElementId):
+        return False
+
+    if isinstance(material_id, ElementId):
+        target_id = material_id
+    else:
+        try:
+            target_id = ElementId(int(material_id))
+        except Exception:
+            return False
+
+    param = None
+    try:
+        param = part.get_Parameter(BuiltInParameter.DPART_MATERIAL_ID)
+    except Exception:
+        param = None
+
+    if param and not getattr(param, 'IsReadOnly', True):
+        try:
+            param.Set(target_id)
+            return True
+        except Exception:
+            pass
+
+    try:
+        part.MaterialId = target_id
+        return True
+    except Exception:
+        return False
+
+
 class CompositeWallPartsPipeline(object):
     """Реализует пайплайн: подготовка вида → создание Parts → отчёт."""
 
@@ -890,9 +924,9 @@ class CompositeWallPartsPipeline(object):
 
 
     def _rename_parts(self, part_ids, layers):
-        """Присваивает частям имена, основанные на данных слоёв."""
+        """Обновляет части на основе данных слоёв (имя + материал)."""
         if not part_ids:
-            return 0
+            return 0, 0
 
         if not layers:
             iterable = ((part_id, None) for part_id in part_ids)
@@ -902,6 +936,7 @@ class CompositeWallPartsPipeline(object):
             iterable = zip(part_ids, layers)
 
         renamed = 0
+        material_assigned = 0
         for part_id, layer in iterable:
             try:
                 part = self.doc.GetElement(part_id)
@@ -911,6 +946,9 @@ class CompositeWallPartsPipeline(object):
             if part is None:
                 continue
 
+            if layer and _set_part_material(part, layer.get('material_id')):
+                material_assigned += 1
+
             display_name = _format_layer_part_name(layer) if layer else None
             if not display_name:
                 continue
@@ -918,7 +956,7 @@ class CompositeWallPartsPipeline(object):
             if _set_part_name(part, display_name):
                 renamed += 1
 
-        return renamed
+        return renamed, material_assigned
 
 
     def _report_layers(self, layers):
@@ -1141,11 +1179,15 @@ class CompositeWallPartsPipeline(object):
 
             with revit.Transaction(u"Обновление частей (Parts)"):
                 self._ensure_view_ready()
-                renamed = self._rename_parts(existing_parts, layers)
+                renamed, material_updated = self._rename_parts(existing_parts, layers)
 
             if renamed:
                 output.print_md(
                     u"ℹ️ Обновлены имена {} частей в соответствии со слоями.".format(renamed)
+                )
+            if material_updated:
+                output.print_md(
+                    u"ℹ️ Материалы обновлены у {} частей в соответствии со слоями.".format(material_updated)
                 )
 
             self._report_parts(existing_parts, layers)
@@ -1175,11 +1217,15 @@ class CompositeWallPartsPipeline(object):
             return
 
         with revit.Transaction(u"Переименование Parts по слоям"):
-            renamed = self._rename_parts(part_ids, layers)
+            renamed, material_updated = self._rename_parts(part_ids, layers)
 
         if renamed:
             output.print_md(
                 u"ℹ️ Частям присвоены имена по слоям ({} элементов).".format(renamed)
+            )
+        if material_updated:
+            output.print_md(
+                u"ℹ️ Материалы назначены для {} частей по данным слоёв.".format(material_updated)
             )
 
         output.print_md(u"## ✅ Стена преобразована в Parts")
