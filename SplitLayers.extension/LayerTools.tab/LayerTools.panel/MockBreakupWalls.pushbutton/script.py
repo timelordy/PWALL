@@ -636,6 +636,8 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
     if other_walls is None:
         other_walls = []
 
+    created_instances = []
+
     for info in instances:
         symbol = info['symbol']
         if symbol is None:
@@ -680,15 +682,28 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
         except Exception:
             pass
 
-        if _CAN_ADD_VOID_CUT and _ADD_INSTANCE_VOID_CUT:
-            for extra_wall in other_walls:
-                if extra_wall is None or extra_wall.Id == new_host_wall.Id:
-                    continue
-                try:
-                    if _CAN_ADD_VOID_CUT(doc, new_inst, extra_wall):
-                        _ADD_INSTANCE_VOID_CUT(doc, new_inst, extra_wall)
-                except Exception:
-                    continue
+        created_instances.append(new_inst)
+
+    if not created_instances:
+        return
+
+    try:
+        doc.Regenerate()
+    except Exception:
+        pass
+
+    if not (_CAN_ADD_VOID_CUT and _ADD_INSTANCE_VOID_CUT):
+        return
+
+    for new_inst in created_instances:
+        for extra_wall in other_walls:
+            if extra_wall is None or extra_wall.Id == new_host_wall.Id:
+                continue
+            try:
+                if _CAN_ADD_VOID_CUT(doc, new_inst, extra_wall):
+                    _ADD_INSTANCE_VOID_CUT(doc, new_inst, extra_wall)
+            except Exception:
+                continue
 
 
 def _breakup_wall(wall):
