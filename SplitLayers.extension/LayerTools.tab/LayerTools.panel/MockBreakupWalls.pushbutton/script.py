@@ -28,6 +28,7 @@ from Autodesk.Revit.DB import (
     WallUtils,
     XYZ,
     JoinGeometryUtils,
+    InstanceVoidCutUtils,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -43,6 +44,9 @@ logger = script.get_logger()
 
 _WIDTH_EPS = 1e-6
 _SIGNATURE_CACHE = {}
+
+_CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
+_ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
 
 try:
     _TEXT_TYPE = unicode
@@ -60,6 +64,52 @@ def _to_unicode(value):
             return _TEXT_TYPE(str(value))
         except Exception:
             return u''
+
+
+_LAYER_FUNCTION_MAP = {
+    MaterialFunctionAssignment.Structure: u"Несущий слой",
+    MaterialFunctionAssignment.Substrate: u"Основание",
+    MaterialFunctionAssignment.Insulation: u"Утеплитель",
+    MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
+    MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
+    MaterialFunctionAssignment.Membrane: u"Мембрана",
+}
+
+_DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
+if _DEFAULT_LAYER_FUNCTION is not None and _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
+    _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
+
+
+def _describe_layer_function(layer_function):
+    try:
+        return _LAYER_FUNCTION_MAP[layer_function]
+    except Exception:
+        return _to_unicode(layer_function)
+
+
+class _LayerChoice(object):
+    def __init__(self, layer_info):
+        self.layer_info = layer_info
+        function_name = _describe_layer_function(layer_info.get('function'))
+        width_mm = _feet_to_mm(layer_info.get('width', 0.0))
+        try:
+            width_text = u"{:.1f}".format(width_mm)
+        except Exception:
+            width_text = _to_unicode(width_mm)
+        self.name = u"Слой {index}: {function} ({width} мм)".format(
+            index=layer_info.get('index'),
+            function=function_name,
+            width=width_text,
+        )
+
+    def __unicode__(self):
+        return self.name
+
+    def __str__(self):  # pragma: no cover - совместимость Python 2/3
+        try:
+            return self.name.encode('utf-8')
+        except Exception:
+            return _to_unicode(self.name)
 
 
 def _get_element_name(element):
@@ -212,6 +262,40 @@ def _structure_layers_data(structure):
     core_end = data[last_core]['end'] if data and last_core not in (-1, None) else total_width
 
     return data, total_width, core_start, core_end
+
+
+def _select_host_layer(layer_data):
+    choices = [_LayerChoice(info) for info in layer_data]
+    if not choices:
+        return None
+
+    default_choice = None
+    for choice in choices:
+        if choice.layer_info.get('function') == MaterialFunctionAssignment.Structure:
+            default_choice = choice
+            break
+
+    select_kwargs = {
+        'title': u"Выберите слой, к которому привязать дверные и оконные элементы",
+        'button_name': u"Выбрать",
+        'multiselect': False,
+        'name_attr': 'name',
+    }
+    if default_choice is not None:
+        select_kwargs['default'] = default_choice
+
+    selection = forms.SelectFromList.show(choices, **select_kwargs)
+
+    if isinstance(selection, list):
+        selection = selection[0] if selection else None
+
+    if isinstance(selection, _LayerChoice):
+        try:
+            return dict(selection.layer_info)
+        except Exception:
+            return selection.layer_info
+
+    return None
 
 
 def _reference_offset(location_line_value, total_width, core_start, core_end):
@@ -545,7 +629,13 @@ def _collect_hosted_instances(wall):
     return hosted
 
 
-def _rehost_instances(instances, new_host_wall):
+def _rehost_instances(instances, new_host_wall, other_walls=None):
+    if new_host_wall is None:
+        return
+
+    if other_walls is None:
+        other_walls = []
+
     for info in instances:
         symbol = info['symbol']
         if symbol is None:
@@ -574,9 +664,31 @@ def _rehost_instances(instances, new_host_wall):
             continue
 
         try:
+            if info.get('hand_flipped') and hasattr(new_inst, 'HandFlipped') and not new_inst.HandFlipped:
+                new_inst.flipHand()
+        except Exception:
+            pass
+
+        try:
+            if info.get('face_flipped') and hasattr(new_inst, 'FacingFlipped') and not new_inst.FacingFlipped:
+                new_inst.flipFacing()
+        except Exception:
+            pass
+
+        try:
             doc.Delete(info['id'])
         except Exception:
             pass
+
+        if _CAN_ADD_VOID_CUT and _ADD_INSTANCE_VOID_CUT:
+            for extra_wall in other_walls:
+                if extra_wall is None or extra_wall.Id == new_host_wall.Id:
+                    continue
+                try:
+                    if _CAN_ADD_VOID_CUT(doc, new_inst, extra_wall):
+                        _ADD_INSTANCE_VOID_CUT(doc, new_inst, extra_wall)
+                except Exception:
+                    continue
 
 
 def _breakup_wall(wall):
@@ -589,6 +701,11 @@ def _breakup_wall(wall):
     layer_data = [item for item in layer_data if item['width'] > _WIDTH_EPS]
     if not layer_data:
         forms.alert(u'Нет слоёв с ненулевой толщиной.', exitscript=True)
+        return
+
+    host_layer_info = _select_host_layer(layer_data)
+    if not host_layer_info:
+        forms.alert(u'Операция отменена пользователем.', exitscript=True)
         return
 
     try:
@@ -661,15 +778,25 @@ def _breakup_wall(wall):
             t.RollBack()
             return
 
-        structural_wall = None
+        selected_layer_index = host_layer_info.get('index')
+        host_wall = None
         for wall_part, layer_info in zip(created_walls, layer_data):
-            if layer_info.get('function') == MaterialFunctionAssignment.Structure:
-                structural_wall = wall_part
+            if layer_info.get('index') == selected_layer_index:
+                host_wall = wall_part
                 break
-        if structural_wall is None:
-            structural_wall = created_walls[0]
 
-        _rehost_instances(hosted_instances, structural_wall)
+        if host_wall is None:
+            for wall_part, layer_info in zip(created_walls, layer_data):
+                if layer_info.get('function') == MaterialFunctionAssignment.Structure:
+                    host_wall = wall_part
+                    break
+
+        if host_wall is None:
+            host_wall = created_walls[0]
+
+        other_walls = [w for w in created_walls if w.Id != host_wall.Id]
+
+        _rehost_instances(hosted_instances, host_wall, other_walls)
 
         for i in range(len(created_walls)):
             for j in range(i + 1, len(created_walls)):
@@ -713,3 +840,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
