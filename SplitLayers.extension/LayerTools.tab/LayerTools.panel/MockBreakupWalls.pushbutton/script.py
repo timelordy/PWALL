@@ -10,6 +10,7 @@ clr.AddReference('System')
 from System.Collections.Generic import List
 
 from Autodesk.Revit.DB import (
+    BuiltInCategory,
     BuiltInParameter,
     CompoundStructure,
     CompoundStructureLayer,
@@ -17,6 +18,7 @@ from Autodesk.Revit.DB import (
     FamilyInstance,
     FilteredElementCollector,
     LocationCurve,
+    LocationPoint,
     MaterialFunctionAssignment,
     Transform,
     Transaction,
@@ -35,6 +37,7 @@ from Autodesk.Revit.UI.Selection import ObjectType
 
 from pyrevit import revit, forms, script
 
+import math
 import re
 
 
@@ -187,6 +190,234 @@ def _collect_structure(wall):
         return structure, []
 
     return structure, layers
+
+
+_DOOR_WIDTH_PARAM_NAMES = (
+    'DOOR_WIDTH',
+    'FAMILY_WIDTH_PARAM',
+    'INSTANCE_WIDTH_PARAM',
+)
+
+_DOOR_HEIGHT_PARAM_NAMES = (
+    'DOOR_HEIGHT',
+    'FAMILY_HEIGHT_PARAM',
+    'INSTANCE_HEIGHT_PARAM',
+)
+
+_DOOR_SILL_PARAM_NAMES = (
+    'INSTANCE_SILL_HEIGHT_PARAM',
+    'SYMBOL_SILL_HEIGHT_PARAM',
+    'FAMILY_SILL_HEIGHT_PARAM',
+)
+
+
+def _get_parameter_as_double(element, param_name_candidates):
+    if element is None:
+        return None
+
+    for name in param_name_candidates:
+        if not name:
+            continue
+        param_enum = getattr(BuiltInParameter, name, None)
+        if param_enum is None:
+            continue
+        try:
+            param = element.get_Parameter(param_enum)
+        except Exception:
+            param = None
+        if param is None or not param.HasValue:
+            continue
+        try:
+            value = param.AsDouble()
+        except Exception:
+            value = None
+        if value is None:
+            try:
+                value = float(param.AsInteger())
+            except Exception:
+                value = None
+        if value is None:
+            try:
+                text = param.AsValueString()
+                if text:
+                    value = float(text)
+            except Exception:
+                value = None
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return None
+
+
+def _vector_length(vector):
+    try:
+        return math.sqrt(
+            float(getattr(vector, 'X', 0.0)) ** 2
+            + float(getattr(vector, 'Y', 0.0)) ** 2
+            + float(getattr(vector, 'Z', 0.0)) ** 2
+        )
+    except Exception:
+        return 0.0
+
+
+def _normalize_vector(vector):
+    if vector is None:
+        return None
+    try:
+        normalized = vector.Normalize()
+        if normalized is not None and not normalized.IsZeroLength():
+            return normalized
+    except Exception:
+        pass
+    length = _vector_length(vector)
+    if length <= _WIDTH_EPS:
+        return None
+    try:
+        x = float(getattr(vector, 'X', 0.0)) / length
+        y = float(getattr(vector, 'Y', 0.0)) / length
+        z = float(getattr(vector, 'Z', 0.0)) / length
+        return XYZ(x, y, z)
+    except Exception:
+        return None
+
+
+def _project_point_on_curve(curve, point):
+    if curve is None or point is None:
+        return None
+    try:
+        projection = curve.Project(point)
+        if projection is not None:
+            return projection.XYZPoint
+    except Exception:
+        pass
+    return None
+
+
+def _is_door_instance(instance):
+    try:
+        door_category_id = int(BuiltInCategory.OST_Doors)
+    except Exception:
+        door_category_id = None
+
+    if instance is None:
+        return False
+
+    try:
+        category = instance.Category
+    except Exception:
+        category = None
+    if category is not None and door_category_id is not None:
+        try:
+            if category.Id and category.Id.IntegerValue == door_category_id:
+                return True
+        except Exception:
+            pass
+
+    symbol = getattr(instance, 'Symbol', None)
+    family = getattr(symbol, 'Family', None)
+    family_category = getattr(family, 'FamilyCategory', None)
+    if family_category is not None and door_category_id is not None:
+        try:
+            if family_category.Id and family_category.Id.IntegerValue == door_category_id:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _ensure_opening_matching_instance(instance, wall):
+    width = _get_parameter_as_double(instance, _DOOR_WIDTH_PARAM_NAMES)
+    height = _get_parameter_as_double(instance, _DOOR_HEIGHT_PARAM_NAMES)
+
+    if width is None or width <= _WIDTH_EPS:
+        return False
+    if height is None or height <= _WIDTH_EPS:
+        return False
+
+    location = getattr(instance, 'Location', None)
+    point = None
+    if isinstance(location, LocationPoint):
+        point = location.Point
+    elif isinstance(location, LocationCurve):
+        try:
+            curve_mid = location.Curve
+            point = curve_mid.Evaluate(0.5, True)
+        except Exception:
+            try:
+                point = location.Curve.GetEndPoint(0)
+            except Exception:
+                point = None
+    if point is None:
+        return False
+
+    host_location = getattr(wall, 'Location', None)
+    if not isinstance(host_location, LocationCurve):
+        return False
+
+    host_curve = host_location.Curve
+    if host_curve is None:
+        return False
+
+    projected_point = _project_point_on_curve(host_curve, point) or point
+
+    try:
+        derivatives = host_curve.ComputeDerivatives(0.5, True)
+        tangent = derivatives.BasisX
+    except Exception:
+        tangent = None
+
+    if tangent is None or tangent.IsZeroLength():
+        try:
+            tangent = host_curve.GetEndPoint(1) - host_curve.GetEndPoint(0)
+        except Exception:
+            tangent = None
+
+    tangent = _normalize_vector(tangent)
+    if tangent is None:
+        return False
+
+    half_vector = _scale_vector(tangent, width / 2.0)
+    if half_vector is None:
+        return False
+
+    sill_height = _get_parameter_as_double(instance, _DOOR_SILL_PARAM_NAMES)
+    base_z = float(getattr(point, 'Z', 0.0))
+    if sill_height is not None:
+        base_z -= float(sill_height)
+
+    bottom_center = XYZ(projected_point.X, projected_point.Y, base_z)
+    try:
+        bottom_left = XYZ(
+            bottom_center.X - getattr(half_vector, 'X', 0.0),
+            bottom_center.Y - getattr(half_vector, 'Y', 0.0),
+            bottom_center.Z,
+        )
+        top_right = XYZ(
+            bottom_center.X + getattr(half_vector, 'X', 0.0),
+            bottom_center.Y + getattr(half_vector, 'Y', 0.0),
+            bottom_center.Z + height,
+        )
+    except Exception:
+        return False
+
+    try:
+        opening = doc.Create.NewOpening(wall, bottom_left, top_right)
+    except Exception:
+        return False
+
+    if opening is None:
+        return False
+
+    try:
+        doc.Regenerate()
+    except Exception:
+        pass
+
+    return True
 
 
 def _structure_layers_data(structure):
@@ -620,6 +851,7 @@ def _collect_hosted_instances(wall):
         hosted.append({
             'id': inst.Id,
             'symbol': inst.Symbol,
+            'category_id': inst.Category.Id if getattr(inst, 'Category', None) else None,
             'level_id': inst.LevelId if inst.LevelId.IntegerValue > 0 else None,
             'location_point': location_point,
             'location_curve': location_curve,
@@ -682,6 +914,7 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
         except Exception:
             pass
 
+        info['category_id'] = getattr(new_inst.Category, 'Id', info.get('category_id'))
         created_instances.append(new_inst)
 
     if not created_instances:
@@ -696,8 +929,14 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
         return
 
     for new_inst in created_instances:
+        is_door = _is_door_instance(new_inst)
         for extra_wall in other_walls:
             if extra_wall is None or extra_wall.Id == new_host_wall.Id:
+                continue
+            trimmed = False
+            if is_door:
+                trimmed = _ensure_opening_matching_instance(new_inst, extra_wall)
+            if trimmed:
                 continue
             try:
                 if _CAN_ADD_VOID_CUT(doc, new_inst, extra_wall):
