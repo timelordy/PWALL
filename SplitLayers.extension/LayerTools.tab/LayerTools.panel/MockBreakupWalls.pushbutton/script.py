@@ -152,6 +152,9 @@ def _get_instance_clear_width(instance):
             return value
 
     fallback_names = (
+        u'Clear Width',
+        u'Opening Width',
+        u'Rough Width',
         u'Width',
         u'WIDTH',
         u'Nominal Width',
@@ -1619,17 +1622,19 @@ def _ensure_opening_for_instance(
         if fallback_width is not None and fallback_width > _WIDTH_EPS:
             effective_preferred = fallback_width
 
-    width_candidates = [
-        geometry_width,
-        effective_preferred,
-        host_reference_width,
-        width_from_points,
-    ]
-
-    width_values = [val for val in width_candidates if val is not None and val > _WIDTH_EPS]
-    if not width_values:
-        return False
-    width = min(width_values)
+    width = None
+    if effective_preferred is not None and effective_preferred > _WIDTH_EPS:
+        width = effective_preferred
+    else:
+        width_candidates = [
+            geometry_width,
+            host_reference_width,
+            width_from_points,
+        ]
+        width_values = [val for val in width_candidates if val is not None and val > _WIDTH_EPS]
+        if not width_values:
+            return False
+        width = min(width_values)
 
     height_candidates = [
         geometry_height,
@@ -1773,18 +1778,17 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
 
         host_opening_points = _extract_opening_points(new_inst, new_host_wall)
 
-        explicit_width = geometry_metrics.get('width') if geometry_metrics else None
-        if explicit_width is None or explicit_width <= _WIDTH_EPS:
-            fallback_width = _get_instance_clear_width(new_inst)
-            if fallback_width is not None and fallback_width > _WIDTH_EPS:
-                explicit_width = fallback_width
+        width_from_params = _get_instance_clear_width(new_inst)
+        width_from_geometry = geometry_metrics.get('width') if geometry_metrics else None
+
+        preferred_width = None
+        if width_from_params is not None and width_from_params > _WIDTH_EPS:
+            preferred_width = width_from_params
+        elif width_from_geometry is not None and width_from_geometry > _WIDTH_EPS:
+            preferred_width = width_from_geometry
 
         host_opening_width = _measure_opening_width(host_opening_points, new_host_wall)
-        shrink_extra_walls = (
-            explicit_width is not None
-            and host_opening_width is not None
-            and explicit_width + _WIDTH_EPS < host_opening_width - _WIDTH_EPS
-        )
+        manual_cut_available = preferred_width is not None and preferred_width > _WIDTH_EPS
 
         fallback_walls = []
         for extra_wall in other_walls or []:
@@ -1792,7 +1796,7 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
                 continue
 
             use_void_cut = (
-                not shrink_extra_walls
+                not manual_cut_available
                 and _CAN_ADD_VOID_CUT
                 and _ADD_INSTANCE_VOID_CUT
             )
@@ -1820,7 +1824,7 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
                     new_inst,
                     extra_wall,
                     reference_points=host_opening_points,
-                    preferred_width=explicit_width,
+                    preferred_width=preferred_width,
                     geometry_cache=geometry_metrics,
                 )
             except Exception:
