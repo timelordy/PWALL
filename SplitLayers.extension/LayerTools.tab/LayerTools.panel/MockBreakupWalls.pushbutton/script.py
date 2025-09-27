@@ -1311,7 +1311,13 @@ def _measure_opening_width(points, wall):
     return max(projections) - min(projections)
 
 
-def _ensure_opening_for_instance(instance, wall, margin=_OPENING_MARGIN, reference_points=None):
+def _ensure_opening_for_instance(
+        instance,
+        wall,
+        margin=_OPENING_MARGIN,
+        reference_points=None,
+        preferred_width=None,
+):
     if instance is None or wall is None:
         return False
 
@@ -1345,6 +1351,10 @@ def _ensure_opening_for_instance(instance, wall, margin=_OPENING_MARGIN, referen
         points = list(reference_points)
     if not points:
         points = _extract_opening_points(instance, wall)
+
+    host_reference_width = None
+    if reference_points:
+        host_reference_width = _measure_opening_width(reference_points, wall)
 
     bbox = None
     if not points:
@@ -1413,9 +1423,33 @@ def _ensure_opening_for_instance(instance, wall, margin=_OPENING_MARGIN, referen
     if height <= _WIDTH_EPS:
         return False
 
-    width = width_from_points
-    if explicit_width is not None:
-        width = explicit_width
+    width_candidates = []
+    if width_from_points is not None and width_from_points > _WIDTH_EPS:
+        width_candidates.append(width_from_points)
+    if host_reference_width is not None and host_reference_width > _WIDTH_EPS:
+        width_candidates.append(host_reference_width)
+
+    if preferred_width is None and explicit_width is not None and explicit_width > _WIDTH_EPS:
+        preferred_width = explicit_width
+
+    width = None
+    if preferred_width is not None and preferred_width > _WIDTH_EPS:
+        if width_candidates:
+            viable = [val for val in width_candidates if val > _WIDTH_EPS]
+            if viable:
+                width = min(min(viable), preferred_width)
+            else:
+                width = preferred_width
+        else:
+            width = preferred_width
+    elif width_candidates:
+        width = max(width_candidates)
+
+    if width is None:
+        width = width_from_points or host_reference_width or preferred_width or explicit_width
+
+    if width is None or width <= _WIDTH_EPS:
+        return False
 
     width = width + 2.0 * margin
     height = height + 2.0 * margin
@@ -1566,7 +1600,12 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
 
         for extra_wall in fallback_walls:
             try:
-                _ensure_opening_for_instance(new_inst, extra_wall, reference_points=host_opening_points)
+                _ensure_opening_for_instance(
+                    new_inst,
+                    extra_wall,
+                    reference_points=host_opening_points,
+                    preferred_width=explicit_width,
+                )
             except Exception:
                 continue
 
