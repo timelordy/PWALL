@@ -42,6 +42,9 @@ from Autodesk.Revit.DB import (
     XYZ,
     JoinGeometryUtils,
     InstanceVoidCutUtils,
+    GeometryInstance,
+    Options,
+    Solid,
     ViewDetailLevel,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
@@ -131,13 +134,16 @@ def _get_instance_clear_width(instance):
     if instance is None:
         return None
 
-    width_param_names = (
+    builtin_names = (
         'DOOR_WIDTH',
         'WINDOW_WIDTH',
         'INSTANCE_WIDTH_PARAM',
         'FAMILY_WIDTH_PARAM',
+        'SYMBOL_WIDTH_PARAM',
+        'DOOR_PANEL_WIDTH',
+        'DOOR_OPENING_WIDTH',
     )
-    for param_name in width_param_names:
+    for param_name in builtin_names:
         param_id = getattr(BuiltInParameter, param_name, None)
         if param_id is None:
             continue
@@ -145,7 +151,178 @@ def _get_instance_clear_width(instance):
         if value is not None and value > _WIDTH_EPS:
             return value
 
+    fallback_names = (
+        u'Width',
+        u'WIDTH',
+        u'Nominal Width',
+        u'Номинальная ширина',
+        u'Ширина',
+        u'ширина',
+    )
+
+    for name in fallback_names:
+        try:
+            param = instance.LookupParameter(name)
+        except Exception:
+            param = None
+        value = None
+        if param is not None:
+            try:
+                value = param.AsDouble()
+            except Exception:
+                value = None
+        if value is not None and value > _WIDTH_EPS:
+            return value
+
+    symbol = getattr(instance, 'Symbol', None)
+    if symbol is not None:
+        for name in fallback_names:
+            try:
+                param = symbol.LookupParameter(name)
+            except Exception:
+                param = None
+            value = None
+            if param is not None:
+                try:
+                    value = param.AsDouble()
+                except Exception:
+                    value = None
+            if value is not None and value > _WIDTH_EPS:
+                return value
+
     return None
+
+
+
+def _collect_geometry_edge_points(geometry, transform=None):
+    if transform is None:
+        transform = Transform.Identity
+
+    points = []
+    if geometry is None:
+        return points
+
+    for obj in geometry:
+        if isinstance(obj, Solid):
+            skip_solid = False
+            try:
+                if getattr(obj, 'Volume', None) is not None and obj.Volume <= _WIDTH_EPS:
+                    skip_solid = True
+            except Exception:
+                pass
+            if skip_solid:
+                continue
+
+            collected = False
+            try:
+                edges = obj.Edges
+            except Exception:
+                edges = None
+            if edges is not None:
+                try:
+                    iterator = iter(edges)
+                except TypeError:
+                    iterator = None
+                else:
+                    for edge in edges:
+                        try:
+                            curve = edge.AsCurve()
+                        except Exception:
+                            curve = None
+                        if curve is None:
+                            continue
+                        for end_idx in (0, 1):
+                            try:
+                                pt = curve.GetEndPoint(end_idx)
+                            except Exception:
+                                pt = None
+                            if pt is None:
+                                continue
+                            try:
+                                points.append(transform.OfPoint(pt))
+                                collected = True
+                            except Exception:
+                                pass
+            if not collected:
+                try:
+                    bbox = obj.GetBoundingBox()
+                except Exception:
+                    bbox = None
+                if bbox is not None:
+                    raw_points = [
+                        XYZ(bbox.Min.X, bbox.Min.Y, bbox.Min.Z),
+                        XYZ(bbox.Max.X, bbox.Min.Y, bbox.Min.Z),
+                        XYZ(bbox.Min.X, bbox.Max.Y, bbox.Min.Z),
+                        XYZ(bbox.Max.X, bbox.Max.Y, bbox.Min.Z),
+                        XYZ(bbox.Min.X, bbox.Min.Y, bbox.Max.Z),
+                        XYZ(bbox.Max.X, bbox.Min.Y, bbox.Max.Z),
+                        XYZ(bbox.Min.X, bbox.Max.Y, bbox.Max.Z),
+                        XYZ(bbox.Max.X, bbox.Max.Y, bbox.Max.Z),
+                    ]
+                    for pt in raw_points:
+                        try:
+                            points.append(transform.OfPoint(pt))
+                        except Exception:
+                            pass
+        elif isinstance(obj, GeometryInstance):
+            nested_transform = transform.Multiply(obj.Transform)
+            try:
+                nested_geometry = obj.GetSymbolGeometry()
+            except Exception:
+                try:
+                    nested_geometry = obj.GetInstanceGeometry()
+                except Exception:
+                    nested_geometry = None
+            nested_points = _collect_geometry_edge_points(nested_geometry, nested_transform)
+            if nested_points:
+                points.extend(nested_points)
+
+    return points
+
+
+def _get_instance_geometry_metrics(instance, width_direction=None):
+    if instance is None:
+        return {}
+
+    try:
+        options = Options()
+        options.DetailLevel = ViewDetailLevel.Fine
+        options.IncludeNonVisibleObjects = False
+    except Exception:
+        options = None
+
+    geometry = None
+    try:
+        geometry = instance.get_Geometry(options) if options is not None else instance.get_Geometry(None)
+    except Exception:
+        try:
+            geometry = instance.get_Geometry(None)
+        except Exception:
+            geometry = None
+
+    points = _collect_geometry_edge_points(geometry)
+    if not points:
+        return {}
+
+    metrics = {}
+
+    if width_direction is not None and not getattr(width_direction, 'IsZeroLength', lambda: True)():
+        try:
+            direction = width_direction.Normalize()
+        except Exception:
+            direction = None
+        if direction is not None:
+            projections = [direction.DotProduct(pt) for pt in points]
+            if projections:
+                metrics['width'] = max(projections) - min(projections)
+
+    heights = [pt.Z for pt in points]
+    if heights:
+        metrics['bottom'] = min(heights)
+        metrics['top'] = max(heights)
+        metrics['height'] = metrics['top'] - metrics['bottom']
+
+    return metrics
 
 
 def _element_id_to_int(elem_id):
@@ -1317,6 +1494,7 @@ def _ensure_opening_for_instance(
         margin=_OPENING_MARGIN,
         reference_points=None,
         preferred_width=None,
+        geometry_cache=None,
 ):
     if instance is None or wall is None:
         return False
@@ -1352,12 +1530,8 @@ def _ensure_opening_for_instance(
     if not points:
         points = _extract_opening_points(instance, wall)
 
-    host_reference_width = None
-    if reference_points:
-        host_reference_width = _measure_opening_width(reference_points, wall)
-
-    bbox = None
     if not points:
+        bbox = None
         try:
             bbox = instance.get_BoundingBox(None)
         except Exception:
@@ -1391,7 +1565,19 @@ def _ensure_opening_for_instance(
     top_z_points = max(heights)
     height_from_points = top_z_points - bottom_z_points
 
-    explicit_width = _get_instance_clear_width(instance)
+    geometry_info = geometry_cache
+    if geometry_info is None:
+        geometry_info = _get_instance_geometry_metrics(instance, wall_direction)
+
+    geometry_width = geometry_info.get('width') if geometry_info else None
+    geometry_bottom = geometry_info.get('bottom') if geometry_info else None
+    geometry_top = geometry_info.get('top') if geometry_info else None
+    geometry_height = geometry_info.get('height') if geometry_info else None
+
+    host_reference_width = None
+    if reference_points:
+        host_reference_width = _measure_opening_width(reference_points, wall)
+
     door_height_param = _get_param_double(instance, BuiltInParameter.DOOR_HEIGHT)
     sill_height = _get_param_double(instance, BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
     head_height = _get_param_double(instance, BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM)
@@ -1404,52 +1590,56 @@ def _ensure_opening_for_instance(
     except Exception:
         level_elevation = None
 
-    bottom_z = None
+    bottom_from_params = None
     if level_elevation is not None and sill_height is not None:
-        bottom_z = level_elevation + sill_height
+        bottom_from_params = level_elevation + sill_height
 
-    top_z = None
+    top_from_params = None
     if level_elevation is not None and head_height is not None:
-        top_z = level_elevation + head_height
-    elif bottom_z is not None and door_height_param is not None:
-        top_z = bottom_z + door_height_param
+        top_from_params = level_elevation + head_height
+    elif bottom_from_params is not None and door_height_param is not None:
+        top_from_params = bottom_from_params + door_height_param
 
-    if bottom_z is None:
-        bottom_z = bottom_z_points
-    if top_z is None:
-        top_z = top_z_points
+    if bottom_from_params is None:
+        bottom_from_params = bottom_z_points
+    if top_from_params is None:
+        top_from_params = top_z_points
 
-    height = max(height_from_points, (top_z - bottom_z) if top_z is not None and bottom_z is not None else 0.0)
-    if height <= _WIDTH_EPS:
+    bottom_z = bottom_from_params
+    top_z = top_from_params
+    if geometry_height is not None and geometry_height > _WIDTH_EPS:
+        if geometry_bottom is not None:
+            bottom_z = geometry_bottom
+        if geometry_top is not None:
+            top_z = geometry_top
+
+    effective_preferred = preferred_width
+    if effective_preferred is None or effective_preferred <= _WIDTH_EPS:
+        fallback_width = _get_instance_clear_width(instance)
+        if fallback_width is not None and fallback_width > _WIDTH_EPS:
+            effective_preferred = fallback_width
+
+    width_candidates = [
+        geometry_width,
+        effective_preferred,
+        host_reference_width,
+        width_from_points,
+    ]
+
+    width_values = [val for val in width_candidates if val is not None and val > _WIDTH_EPS]
+    if not width_values:
         return False
+    width = min(width_values)
 
-    width_candidates = []
-    if width_from_points is not None and width_from_points > _WIDTH_EPS:
-        width_candidates.append(width_from_points)
-    if host_reference_width is not None and host_reference_width > _WIDTH_EPS:
-        width_candidates.append(host_reference_width)
-
-    if preferred_width is None and explicit_width is not None and explicit_width > _WIDTH_EPS:
-        preferred_width = explicit_width
-
-    width = None
-    if preferred_width is not None and preferred_width > _WIDTH_EPS:
-        if width_candidates:
-            viable = [val for val in width_candidates if val > _WIDTH_EPS]
-            if viable:
-                width = min(min(viable), preferred_width)
-            else:
-                width = preferred_width
-        else:
-            width = preferred_width
-    elif width_candidates:
-        width = max(width_candidates)
-
-    if width is None:
-        width = width_from_points or host_reference_width or preferred_width or explicit_width
-
-    if width is None or width <= _WIDTH_EPS:
+    height_candidates = [
+        geometry_height,
+        (top_z - bottom_z) if top_z is not None and bottom_z is not None else None,
+        height_from_points,
+    ]
+    height_values = [val for val in height_candidates if val is not None and val > _WIDTH_EPS]
+    if not height_values:
         return False
+    height = max(height_values)
 
     width = width + 2.0 * margin
     height = height + 2.0 * margin
@@ -1463,14 +1653,21 @@ def _ensure_opening_for_instance(
             reference_point = location.Curve.Evaluate(0.5, True)
         except Exception:
             reference_point = None
-    if reference_point is None and bbox is not None:
-        transform = bbox.Transform or Transform.Identity
-        center_local = XYZ(
-            (bbox.Min.X + bbox.Max.X) / 2.0,
-            (bbox.Min.Y + bbox.Max.Y) / 2.0,
-            (bbox.Min.Z + bbox.Max.Z) / 2.0,
-        )
-        reference_point = transform.OfPoint(center_local)
+
+    bbox = None
+    if reference_point is None:
+        try:
+            bbox = instance.get_BoundingBox(None)
+        except Exception:
+            bbox = None
+        if bbox is not None:
+            transform = bbox.Transform or Transform.Identity
+            center_local = XYZ(
+                (bbox.Min.X + bbox.Max.X) / 2.0,
+                (bbox.Min.Y + bbox.Max.Y) / 2.0,
+                (bbox.Min.Z + bbox.Max.Z) / 2.0,
+            )
+            reference_point = transform.OfPoint(center_local)
     if reference_point is None:
         reference_point = XYZ(
             sum(pt.X for pt in points) / len(points),
@@ -1505,7 +1702,7 @@ def _ensure_opening_for_instance(
         doc.Create.NewOpening(wall, bottom_left, top_right)
         return True
     except Exception as exc:
-        logger.debug('Не удалось создать дополнительный проем в стене %s: %s', wall.Id.IntegerValue, exc)
+        logger.debug('Failed to create supplemental opening in wall %s: %s', wall.Id.IntegerValue, exc)
         return False
 
 
@@ -1560,9 +1757,28 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
         except Exception:
             pass
 
+        host_direction = None
+        host_location = getattr(new_host_wall, 'Location', None)
+        if isinstance(host_location, LocationCurve):
+            host_curve = host_location.Curve
+            if host_curve is not None:
+                try:
+                    host_vec = host_curve.GetEndPoint(1) - host_curve.GetEndPoint(0)
+                    if not host_vec.IsZeroLength():
+                        host_direction = host_vec.Normalize()
+                except Exception:
+                    host_direction = None
+
+        geometry_metrics = _get_instance_geometry_metrics(new_inst, host_direction)
+
         host_opening_points = _extract_opening_points(new_inst, new_host_wall)
 
-        explicit_width = _get_instance_clear_width(new_inst)
+        explicit_width = geometry_metrics.get('width') if geometry_metrics else None
+        if explicit_width is None or explicit_width <= _WIDTH_EPS:
+            fallback_width = _get_instance_clear_width(new_inst)
+            if fallback_width is not None and fallback_width > _WIDTH_EPS:
+                explicit_width = fallback_width
+
         host_opening_width = _measure_opening_width(host_opening_points, new_host_wall)
         shrink_extra_walls = (
             explicit_width is not None
@@ -1605,6 +1821,7 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
                     extra_wall,
                     reference_points=host_opening_points,
                     preferred_width=explicit_width,
+                    geometry_cache=geometry_metrics,
                 )
             except Exception:
                 continue
