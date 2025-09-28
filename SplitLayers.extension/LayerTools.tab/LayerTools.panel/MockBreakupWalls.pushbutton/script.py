@@ -740,7 +740,7 @@ def _adjust_view_detail_for_preview():
     if current_value == fine_value:
         return state
 
-    tx = Transaction(doc, 'Adjust view detail level (temporary)')
+    tx = Transaction(doc, 'Настройка детализации вида (временно)')
     try:
         tx.Start()
         detail_param.Set(fine_value)
@@ -763,7 +763,7 @@ def _restore_view_detail(state):
     if detail_param is None or previous_value is None:
         return
 
-    tx = Transaction(doc, 'Restore view detail level')
+    tx = Transaction(doc, 'Возврат детализации вида')
     try:
         tx.Start()
         detail_param.Set(previous_value)
@@ -906,16 +906,17 @@ def _collect_target_walls():
         if id_value is not None:
             non_wall_ids.append(int(id_value))
 
-    def _log_skipped(prefix):
+    def _log_skipped(source):
         if not non_wall_ids:
             return
+        descriptor = 'выбранный' if source == 'selected' else 'указанный'
         if len(non_wall_ids) == 1:
-            logger.warning('%s element %s because it is not a wall.', prefix, non_wall_ids[0])
+            logger.warning('Пропускаю %s элемент %s: это не стена.', descriptor, non_wall_ids[0])
         else:
             preview = ', '.join(str(item) for item in non_wall_ids[:5])
             if len(non_wall_ids) > 5:
                 preview += ', ...'
-            logger.warning('%s %s non-wall element(s): %s', prefix, len(non_wall_ids), preview)
+            logger.warning('Пропускаю элементы, не являющиеся стенами (%s шт.): %s', len(non_wall_ids), preview)
 
     def _log_auto_hosts():
         if not auto_host_pairs:
@@ -923,7 +924,7 @@ def _collect_target_walls():
         preview = ', '.join('{}->{}'.format(src, dst) for src, dst in auto_host_pairs[:5])
         if len(auto_host_pairs) > 5:
             preview += ', ...'
-        logger.debug('Automatically added host walls for hosted elements: %s', preview)
+        logger.debug('Автоматически добавлены стены-хосты для размещённых элементов: %s', preview)
 
     selected_ids = list(uidoc.Selection.GetElementIds())
     if selected_ids:
@@ -936,14 +937,14 @@ def _collect_target_walls():
             except Exception:
                 id_value = None
             _process_element(element, id_value)
-        _log_skipped('Skipping selected')
+        _log_skipped('selected')
         _log_auto_hosts()
         return walls
 
     try:
         references = uidoc.Selection.PickObjects(
             ObjectType.Element,
-            'Select walls to break up into layers'
+            'Выберите стены для разбиения на слои'
         )
     except Exception:
         return []
@@ -966,7 +967,7 @@ def _collect_target_walls():
             id_value = None
         _process_element(element, id_value)
 
-    _log_skipped('Skipping picked')
+    _log_skipped('picked')
     _log_auto_hosts()
     return walls
 
@@ -1248,7 +1249,7 @@ def _clone_wall_type_for_layer(source_type, layer_info):
 
     base_name = _get_element_name(source_type)
     if not base_name:
-        base_name = u"Wall Layer"
+        base_name = u"Слой стены"
 
     base_label = u"{} Слой {} {:.1f} мм".format(base_name, layer_info['index'], width_mm)
     name = _sanitize_name(base_label)
@@ -1707,7 +1708,7 @@ def _ensure_opening_for_instance(
         doc.Create.NewOpening(wall, bottom_left, top_right)
         return True
     except Exception as exc:
-        logger.debug('Failed to create supplemental opening in wall %s: %s', wall.Id.IntegerValue, exc)
+        logger.debug('Не удалось создать дополнительный проём в стене %s: %s', wall.Id.IntegerValue, exc)
         return False
 
 
@@ -1812,7 +1813,7 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
                     except Exception:
                         extra_id = None
                     logger.debug(
-                        'Failed to cut wall %s with instance void %s',
+                        'Не удалось прорезать стену %s пустотой экземпляра %s',
                         extra_id,
                         getattr(getattr(new_inst, 'Id', None), 'IntegerValue', None),
                     )
@@ -1870,12 +1871,12 @@ def _breakup_wall(wall, show_alert=True):
 
     structure, layers = _collect_structure(wall)
     if not layers:
-        return _handle_failure('Wall {} has no compound structure layers.'.format(wall_id))
+        return _handle_failure('Для стены {} не найдены слои составной конструкции.'.format(wall_id))
 
     layer_data, total_width, core_start, core_end = _structure_layers_data(structure)
     layer_data = [item for item in layer_data if item['width'] > _WIDTH_EPS]
     if not layer_data:
-        return _handle_failure('Wall {} has no layers with width.'.format(wall_id))
+        return _handle_failure('Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id))
 
     hosted_instances = _collect_hosted_instances(wall)
     host_layer_info = None
@@ -1904,7 +1905,7 @@ def _breakup_wall(wall, show_alert=True):
         finally:
             _restore_view_detail(preview_state)
         if not host_layer_info:
-            return _handle_failure('Operation cancelled by user.', level='info', status='cancelled')
+            return _handle_failure('Операция отменена пользователем.', level='info', status='cancelled')
 
         selected_layer_index = host_layer_info.get('index')
 
@@ -1925,7 +1926,7 @@ def _breakup_wall(wall, show_alert=True):
 
     created_walls = []
     produced_layers = []
-    t = Transaction(doc, 'Mock breakup wall into layers')
+    t = Transaction(doc, 'Разделение стены на слои')
     t.Start()
     try:
         for layer_info in layer_data:
@@ -1950,7 +1951,7 @@ def _breakup_wall(wall, show_alert=True):
                     context['structural'],
                 )
             except Exception as exc:
-                logger.warning('Failed to create wall for layer %s: %s', layer_info['index'], exc)
+                logger.warning('Не удалось создать стену для слоя %s: %s', layer_info['index'], exc)
                 continue
 
             _apply_vertical_constraints(new_wall, context)
@@ -1970,11 +1971,11 @@ def _breakup_wall(wall, show_alert=True):
 
             created_walls.append(new_wall)
             produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
-            logger.debug('Created wall %s for layer %s', new_wall.Id.IntegerValue, layer_info['index'])
+            logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
 
         if not created_walls:
             t.RollBack()
-            return _handle_failure('No layer walls were created for wall {}.'.format(wall_id))
+            return _handle_failure('Для стены {} не удалось создать ни одной разделённой стены.'.format(wall_id))
 
         host_wall = None
         for record in produced_layers:
@@ -2032,17 +2033,17 @@ def _breakup_wall(wall, show_alert=True):
         try:
             doc.Delete(wall.Id)
         except Exception as exc:
-            logger.warning('Failed to delete original wall %s: %s', wall_id, exc)
+            logger.warning('Не удалось удалить исходную стену %s: %s', wall_id, exc)
             t.RollBack()
-            return _handle_failure('Failed to delete original wall {}.'.format(wall_id))
+            return _handle_failure('Не удалось удалить исходную стену {}.'.format(wall_id))
 
         t.Commit()
     except Exception as exc:
-        logger.exception('Unexpected error while breaking wall %s: %s', wall_id, exc)
+        logger.exception('Непредвиденная ошибка при разбиении стены %s: %s', wall_id, exc)
         t.RollBack()
-        return _handle_failure('Unexpected error while processing wall {}.'.format(wall_id), level='error')
+        return _handle_failure('Непредвиденная ошибка при обработке стены {}.'.format(wall_id), level='error')
 
-    success_message = 'Created {} layer wall(s) from wall {}.'.format(len(created_walls), wall_id)
+    success_message = 'Создано {} стен-слоёв из стены {}.'.format(len(created_walls), wall_id)
     if show_alert:
         forms.alert(success_message)
     else:
@@ -2062,7 +2063,7 @@ def main():
 
     walls = _collect_target_walls()
     if not walls:
-        forms.alert('No walls were selected.')
+        forms.alert('Не выбрано ни одной стены.')
         return
 
     multi_mode = len(walls) > 1
@@ -2079,12 +2080,12 @@ def main():
         total_created = sum(item.get('created', 0) for item in success_results)
 
         summary_lines = [
-            'Walls processed: {}'.format(len(results)),
-            'Walls split successfully: {}'.format(len(success_results)),
-            'New layer walls created: {}'.format(total_created),
+            'Обработано стен: {}'.format(len(results)),
+            'Стены успешно разделены: {}'.format(len(success_results)),
+            'Создано новых стен-слоёв: {}'.format(total_created),
         ]
         if failure_results:
-            summary_lines.append('Walls skipped or failed: {}'.format(len(failure_results)))
+            summary_lines.append('Пропущено или с ошибкой: {}'.format(len(failure_results)))
         forms.alert('\n'.join(summary_lines))
 
 
