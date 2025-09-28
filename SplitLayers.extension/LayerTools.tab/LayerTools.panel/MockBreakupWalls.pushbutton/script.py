@@ -45,9 +45,6 @@ from Autodesk.Revit.DB import (
     GeometryInstance,
     Options,
     Solid,
-    Line,
-    Color,
-    OverrideGraphicSettings,
     ViewDetailLevel,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
@@ -621,14 +618,13 @@ _LAYER_SELECTION_XAML = u"""
 
 
 class _LayerSelectionDialog(object):
-    def __init__(self, choices, default_choice=None, preview=None):
+    def __init__(self, choices, default_choice=None):
         self._choices = choices or []
         reader = XmlReader.Create(StringReader(_LAYER_SELECTION_XAML))
         self._window = XamlReader.Load(reader)
         self._window.WindowStartupLocation = WindowStartupLocation.Manual
         self._listbox = self._window.FindName('LayerList')
         self._ok_button = self._window.FindName('OkButton')
-        self._preview = preview
         self._listbox.ItemsSource = self._choices
         if default_choice in self._choices:
             self._listbox.SelectedItem = default_choice
@@ -637,16 +633,6 @@ class _LayerSelectionDialog(object):
         self._ok_button.Click += self._on_accept
         self._window.KeyDown += self._on_key_down
         self._listbox.MouseDoubleClick += self._on_double_click
-        if self._preview is not None:
-            try:
-                self._listbox.SelectionChanged += self._on_selection_changed
-            except Exception:
-                pass
-            self._highlight_current()
-        try:
-            self._window.Closed += self._on_closed
-        except Exception:
-            pass
         self._result = None
 
     def _position_window(self):
@@ -676,28 +662,6 @@ class _LayerSelectionDialog(object):
     def _on_accept(self, sender, args):
         self._accept()
 
-    def _on_selection_changed(self, sender, args):
-        self._highlight_current()
-
-    def _on_closed(self, sender, args):
-        if self._preview is not None:
-            try:
-                self._preview.clear()
-            except Exception:
-                pass
-
-    def _highlight_current(self):
-        if self._preview is None:
-            return
-        try:
-            choice = self._listbox.SelectedItem
-        except Exception:
-            choice = None
-        try:
-            self._preview.show(choice)
-        except Exception:
-            pass
-
     def _accept(self):
         try:
             self._result = self._listbox.SelectedItem
@@ -718,117 +682,6 @@ class _LayerSelectionDialog(object):
             return self.name.encode('utf-8')
         except Exception:
             return _to_unicode(self.name)
-
-
-class _LayerPreviewOverlay(object):
-    def __init__(self, doc, view, wall, context):
-        self.doc = doc
-        self.view = view
-        self.wall = wall
-        self.context = context or {}
-        self._elements = []
-        self._ogs = OverrideGraphicSettings()
-        try:
-            self._ogs.SetProjectionLineColor(Color(0, 191, 255))
-            self._ogs.SetProjectionLineWeight(8)
-        except Exception:
-            pass
-        self._inward = None
-        try:
-            base_curve = self.context.get('curve')
-            orientation = _ensure_orientation_vector(self.context, base_curve)
-            inward = _negate_vector(orientation)
-            if inward:
-                self._inward = inward.Normalize()
-        except Exception:
-            self._inward = None
-        if self._inward is None:
-            self._inward = XYZ.BasisY
-
-    def _build_curves(self, layer_choice):
-        if layer_choice is None:
-            return []
-        layer_info = getattr(layer_choice, 'layer_info', None)
-        if layer_info is None and isinstance(layer_choice, dict):
-            layer_info = layer_choice
-        if layer_info is None:
-            return []
-        curve = self.context.get('curve')
-        if curve is None or self._inward is None:
-            return []
-        try:
-            start_offset = layer_info.get('start', 0.0) - self.context.get('reference_offset', 0.0)
-            end_offset = layer_info.get('end', 0.0) - self.context.get('reference_offset', 0.0)
-        except Exception:
-            return []
-        try:
-            trans_start = Transform.CreateTranslation(self._inward.Multiply(start_offset))
-            trans_end = Transform.CreateTranslation(self._inward.Multiply(end_offset))
-            curve_a = curve.CreateTransformed(trans_start)
-            curve_b = curve.CreateTransformed(trans_end)
-        except Exception:
-            return []
-        curves = [curve_a, curve_b]
-        try:
-            a0 = curve_a.GetEndPoint(0)
-            b0 = curve_b.GetEndPoint(0)
-            a1 = curve_a.GetEndPoint(1)
-            b1 = curve_b.GetEndPoint(1)
-            curves.append(Line.CreateBound(a0, b0))
-            curves.append(Line.CreateBound(a1, b1))
-        except Exception:
-            pass
-        return curves
-
-    def show(self, layer_choice):
-        self.clear()
-        if self.doc is None or self.view is None:
-            return
-        curves = self._build_curves(layer_choice)
-        if not curves:
-            return
-        tx = Transaction(self.doc, 'Предпросмотр слоя')
-        try:
-            tx.Start()
-            for curve in curves:
-                try:
-                    element = self.doc.Create.NewDetailCurve(self.view, curve)
-                except Exception:
-                    continue
-                self._elements.append(element.Id)
-                try:
-                    self.view.SetElementOverrides(element.Id, self._ogs)
-                except Exception:
-                    pass
-            tx.Commit()
-        except Exception:
-            try:
-                tx.RollBack()
-            except Exception:
-                pass
-            self._elements = []
-
-    def clear(self):
-        if not self._elements or self.doc is None:
-            return
-        tx = Transaction(self.doc, 'Очистка предпросмотра слоя')
-        try:
-            tx.Start()
-            for elem_id in list(self._elements):
-                try:
-                    self.doc.Delete(elem_id)
-                except Exception:
-                    pass
-            tx.Commit()
-        except Exception:
-            try:
-                tx.RollBack()
-            except Exception:
-                pass
-        self._elements = []
-
-    def dispose(self):
-        self.clear()
 
 
 def _get_element_name(element):
@@ -1194,7 +1047,7 @@ def _structure_layers_data(structure):
     return data, total_width, core_start, core_end
 
 
-def _select_host_layer(layer_data, preview=None):
+def _select_host_layer(layer_data):
     choices = [_LayerChoice(info) for info in layer_data]
     if not choices:
         return None
@@ -1205,7 +1058,7 @@ def _select_host_layer(layer_data, preview=None):
             default_choice = choice
             break
 
-    dialog = _LayerSelectionDialog(choices, default_choice, preview=preview)
+    dialog = _LayerSelectionDialog(choices, default_choice)
     selection = dialog.show_dialog()
 
     if isinstance(selection, _LayerChoice):
@@ -2031,16 +1884,10 @@ def _breakup_wall(wall, show_alert=True):
     if not layer_data:
         return _handle_failure('Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id))
 
-    try:
-        context = _build_wall_context(wall, structure, total_width, core_start, core_end)
-    except ValueError as exc:
-        return _handle_failure(str(exc))
-
     hosted_instances = _collect_hosted_instances(wall)
     host_layer_info = None
     selected_layer_index = None
     preview_state = None
-    preview_overlay = None
     if hosted_instances:
         try:
             uidoc.ShowElements(wall.Id)
@@ -2048,7 +1895,9 @@ def _breakup_wall(wall, show_alert=True):
             pass
 
         try:
-            uidoc.Selection.SetElementIds(List[ElementId]())
+            selection_ids = List[ElementId]()
+            selection_ids.Add(wall.Id)
+            uidoc.Selection.SetElementIds(selection_ids)
         except Exception:
             pass
         try:
@@ -2057,20 +1906,19 @@ def _breakup_wall(wall, show_alert=True):
             pass
 
         preview_state = _adjust_view_detail_for_preview()
-        preview_overlay = _LayerPreviewOverlay(doc, uidoc.ActiveView, wall, context)
         try:
-            host_layer_info = _select_host_layer(layer_data, preview=preview_overlay)
+            host_layer_info = _select_host_layer(layer_data)
         finally:
-            if preview_overlay is not None:
-                try:
-                    preview_overlay.dispose()
-                except Exception:
-                    pass
             _restore_view_detail(preview_state)
         if not host_layer_info:
             return _handle_failure('Операция отменена пользователем.', level='info', status='cancelled')
 
         selected_layer_index = host_layer_info.get('index')
+
+    try:
+        context = _build_wall_context(wall, structure, total_width, core_start, core_end)
+    except ValueError as exc:
+        return _handle_failure(str(exc))
 
     orientation = _ensure_orientation_vector(context, context['curve'])
     inward = _negate_vector(orientation)
@@ -2261,3 +2109,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
