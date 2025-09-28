@@ -1788,25 +1788,18 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
         elif width_from_geometry is not None and width_from_geometry > _WIDTH_EPS:
             preferred_width = width_from_geometry
 
-        host_opening_width = _measure_opening_width(host_opening_points, new_host_wall)
-        manual_cut_available = preferred_width is not None and preferred_width > _WIDTH_EPS
 
         fallback_walls = []
         for extra_wall in other_walls or []:
             if extra_wall is None or extra_wall.Id == new_host_wall.Id:
                 continue
 
-            use_void_cut = (
-                not manual_cut_available
-                and _CAN_ADD_VOID_CUT
-                and _ADD_INSTANCE_VOID_CUT
-            )
-
-            if use_void_cut:
+            void_cut_done = False
+            if _CAN_ADD_VOID_CUT and _ADD_INSTANCE_VOID_CUT:
                 try:
                     if _CAN_ADD_VOID_CUT(doc, new_inst, extra_wall):
                         _ADD_INSTANCE_VOID_CUT(doc, new_inst, extra_wall)
-                        continue
+                        void_cut_done = True
                 except Exception:
                     try:
                         extra_id = extra_wall.Id.IntegerValue if extra_wall else None
@@ -1817,19 +1810,32 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
                         extra_id,
                         getattr(getattr(new_inst, 'Id', None), 'IntegerValue', None),
                     )
+
+            if void_cut_done:
+                continue
+
             fallback_walls.append(extra_wall)
 
         for extra_wall in fallback_walls:
             try:
-                _ensure_opening_for_instance(
+                created = _ensure_opening_for_instance(
                     new_inst,
                     extra_wall,
                     reference_points=host_opening_points,
                     preferred_width=preferred_width,
                     geometry_cache=geometry_metrics,
                 )
-            except Exception:
-                continue
+                if not created:
+                    logger.debug(
+                        'Не удалось создать проём в стене %s через прямоугольное отверстие',
+                        getattr(getattr(extra_wall, 'Id', None), 'IntegerValue', None),
+                    )
+            except Exception as exc:
+                logger.debug(
+                    'Ошибка при создании проёма в стене %s: %s',
+                    getattr(getattr(extra_wall, 'Id', None), 'IntegerValue', None),
+                    exc,
+                )
 
         try:
             doc.Delete(info['id'])
@@ -2000,13 +2006,25 @@ def _breakup_wall(wall, show_alert=True):
         if host_wall is None:
             host_wall = produced_layers[0]['wall']
 
-        other_walls = [
-            record['wall']
-            for record in produced_layers
-            if record.get('wall') is not None and record['wall'].Id != host_wall.Id
-        ]
+        host_index = None
+        for idx, record in enumerate(produced_layers):
+            wall_part = record.get('wall')
+            if wall_part is not None and wall_part.Id == host_wall.Id:
+                host_index = idx
+                break
 
-        _rehost_instances(hosted_instances, host_wall, other_walls)
+        if host_index is None:
+            host_index = 0
+
+        preceding_walls = []
+        for idx, record in enumerate(produced_layers):
+            wall_part = record.get('wall')
+            if wall_part is None or wall_part.Id == host_wall.Id:
+                continue
+            if idx < host_index:
+                preceding_walls.append(wall_part)
+
+        _rehost_instances(hosted_instances, host_wall, preceding_walls)
 
         for i in range(len(created_walls)):
             for j in range(i + 1, len(created_walls)):
