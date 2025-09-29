@@ -46,7 +46,6 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
-    WallJoinType,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -71,7 +70,12 @@ _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', Non
 _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
 
 try:
-    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt
+    from Autodesk.Revit.DB import WallJoinType  # type: ignore
+except Exception:
+    WallJoinType = None
+
+try:
+    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt if WallJoinType is not None else None
 except Exception:
     _WALL_JOIN_TYPE_BUTT = None
 
@@ -474,6 +478,16 @@ def _apply_butt_join_type(wall):
     for end_idx in (0, 1):
         try:
             _APPLY_WALL_JOIN_TYPE(wall, end_idx, _WALL_JOIN_TYPE_BUTT)
+        except Exception:
+            continue
+
+
+def _suppress_auto_join(wall):
+    if wall is None:
+        return
+    for end_idx in (0, 1):
+        try:
+            WallUtils.DisallowWallJoinAtEnd(wall, end_idx)
         except Exception:
             continue
 
@@ -2131,15 +2145,11 @@ def _breakup_wall(wall, show_alert=True):
             except Exception:
                 pass
 
-            for end_idx in (0, 1):
-                try:
-                    WallUtils.AllowWallJoinAtEnd(new_wall, end_idx)
-                except Exception:
-                    pass
-
             created_walls.append(new_wall)
             produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
             logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
+
+            _suppress_auto_join(new_wall)
 
         if not created_walls:
             t.RollBack()
@@ -2190,10 +2200,11 @@ def _breakup_wall(wall, show_alert=True):
 
         for i in range(len(created_walls)):
             for j in range(i + 1, len(created_walls)):
-                try:
-                    JoinGeometryUtils.JoinGeometry(doc, created_walls[i], created_walls[j])
-                except Exception:
-                    pass
+                first_id = getattr(created_walls[i], 'Id', None)
+                second_id = getattr(created_walls[j], 'Id', None)
+                if first_id is None or second_id is None:
+                    continue
+                _join_two_walls(first_id, second_id)
 
         try:
             doc.Regenerate()
