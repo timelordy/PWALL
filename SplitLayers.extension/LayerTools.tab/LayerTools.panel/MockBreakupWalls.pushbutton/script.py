@@ -445,31 +445,7 @@ def _join_two_walls(first_id, second_id, should_first_cut=None):
     except Exception:
         pass
 
-    for wall_obj in (first_wall, second_wall):
-        _auto_join_wall(wall_obj)
-
     return True
-
-
-def _auto_join_wall(wall):
-    if wall is None:
-        return False
-
-    joined = False
-    for end_idx in (0, 1):
-        try:
-            WallUtils.AllowWallJoinAtEnd(wall, end_idx)
-            joined = True
-        except Exception:
-            pass
-
-    try:
-        WallUtils.AutoJoinGeometry(doc, wall)
-        joined = True
-    except Exception:
-        pass
-
-    return joined
 
 
 def _attempt_layer_joins(entry_a, entry_b, join_meta=None):
@@ -2078,7 +2054,6 @@ def _breakup_wall(wall, show_alert=True):
 
             created_walls.append(new_wall)
             produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
-            _auto_join_wall(new_wall)
             logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
 
         if not created_walls:
