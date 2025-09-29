@@ -356,6 +356,48 @@ def _match_layer_by_signature(target_layer, candidates, used_ids):
     return None
 
 
+def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_type_id=None):
+    if not isinstance(wall, Wall):
+        return None
+
+    structure, layers = _collect_structure(wall)
+    if not layers:
+        return None
+
+    layer_data, _, _, _ = _structure_layers_data(structure)
+    filtered_layers = []
+    for info in layer_data:
+        width = info.get('width', 0.0) or 0.0
+        if width <= _WIDTH_EPS:
+            continue
+        if expected_signatures:
+            signature = _layer_signature_for_join(info)
+            if signature not in expected_signatures:
+                continue
+        filtered_layers.append({
+            'index': info.get('index'),
+            'function': info.get('function'),
+            'width': width,
+            'material_id': info.get('material_id'),
+            'wall_id': wall.Id,
+        })
+
+    if not filtered_layers:
+        return None
+
+    actual_type_id = _element_id_to_int(getattr(wall.WallType, 'Id', None))
+
+    entry = {
+        'wall_type_id': target_type_id if target_type_id is not None else actual_type_id,
+        'layers': filtered_layers,
+    }
+
+    if actual_type_id is not None:
+        entry['actual_wall_type_id'] = actual_type_id
+
+    return entry
+
+
 def _join_two_walls(first_id, second_id, should_first_cut=None):
     if first_id is None or second_id is None:
         return False
@@ -412,7 +454,10 @@ def _attempt_layer_joins(entry_a, entry_b, join_meta=None):
 
     type_a = entry_a.get('wall_type_id')
     type_b = entry_b.get('wall_type_id')
-    if type_a is None or type_b is None or type_a != type_b:
+    allow_mismatch = False
+    if isinstance(join_meta, dict):
+        allow_mismatch = bool(join_meta.get('allow_mismatch'))
+    if (type_a is None or type_b is None or type_a != type_b) and not allow_mismatch:
         return False
 
     should_first_cut = None
@@ -444,18 +489,30 @@ def _attempt_layer_joins(entry_a, entry_b, join_meta=None):
 
 
 def _invert_join_meta(join_meta):
+    result = {'self_cuts': None, 'allow_mismatch': False}
     if not isinstance(join_meta, dict):
-        return {'self_cuts': None}
+        return result
     value = join_meta.get('self_cuts') if join_meta else None
-    if value is None:
-        return {'self_cuts': None}
-    return {'self_cuts': not value}
+    if value is not None:
+        result['self_cuts'] = not value
+    if join_meta.get('allow_mismatch'):
+        result['allow_mismatch'] = True
+    return result
 
 
-def _collect_joined_wall_ids(wall, wall_type_id):
+def _collect_joined_wall_ids(wall, wall_type_id, layer_data=None):
     results = []
     if wall is None:
         return results
+
+    expected_signatures = None
+    if layer_data:
+        expected_signatures = set()
+        for info in layer_data:
+            try:
+                expected_signatures.add(_layer_signature_for_join(info))
+            except Exception:
+                continue
 
     try:
         joined_elements = JoinGeometryUtils.GetJoinedElements(doc, wall)
@@ -480,33 +537,44 @@ def _collect_joined_wall_ids(wall, wall_type_id):
         except Exception:
             neighbour_type = None
 
+        info = {
+            'id': key,
+            'self_cuts': None,
+            'entry': None,
+            'allow_mismatch': False,
+        }
+
+        try:
+            info['self_cuts'] = JoinGeometryUtils.IsCuttingElementInJoin(doc, wall, neighbour)
+        except Exception:
+            pass
+
         cached_entry = _LAYER_JOIN_CACHE.get(key)
         if cached_entry is not None:
-            if wall_type_id is None or cached_entry.get('wall_type_id') == wall_type_id:
-                info = {
-                    'id': key,
-                    'self_cuts': None,
-                }
-                try:
-                    info['self_cuts'] = JoinGeometryUtils.IsCuttingElementInJoin(doc, wall, neighbour)
-                except Exception:
-                    pass
+            if wall_type_id is None or cached_entry.get('wall_type_id') in (None, wall_type_id):
+                info['entry'] = cached_entry
                 results.append(info)
                 unique_ids.add(key)
             continue
 
         if isinstance(neighbour, Wall):
             if wall_type_id is None or neighbour_type == wall_type_id:
-                info = {
-                    'id': key,
-                    'self_cuts': None,
-                }
-                try:
-                    info['self_cuts'] = JoinGeometryUtils.IsCuttingElementInJoin(doc, wall, neighbour)
-                except Exception:
-                    pass
                 results.append(info)
                 unique_ids.add(key)
+                continue
+
+            if expected_signatures:
+                entry = _build_join_entry_from_existing_wall(
+                    neighbour,
+                    expected_signatures=expected_signatures,
+                    target_type_id=wall_type_id,
+                )
+                if entry and entry.get('layers'):
+                    info['entry'] = entry
+                    info['allow_mismatch'] = True
+                    _LAYER_JOIN_CACHE[key] = entry
+                    results.append(info)
+                    unique_ids.add(key)
 
     return results
 
@@ -516,10 +584,15 @@ def _normalize_join_info(join_info):
         result = dict(join_info)
         result['id'] = _element_id_to_int(result.get('id'))
         result.setdefault('self_cuts', None)
+        if 'entry' not in result:
+            result['entry'] = None
+        result['allow_mismatch'] = bool(result.get('allow_mismatch'))
         return result
     return {
         'id': _element_id_to_int(join_info),
         'self_cuts': None,
+        'entry': None,
+        'allow_mismatch': False,
     }
 
 
@@ -566,7 +639,9 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
         if neighbour_id is None:
             continue
 
-        neighbour_entry = _LAYER_JOIN_CACHE.get(neighbour_id)
+        neighbour_entry = info.get('entry')
+        if not neighbour_entry:
+            neighbour_entry = _LAYER_JOIN_CACHE.get(neighbour_id)
         if neighbour_entry:
             _attempt_layer_joins(entry, neighbour_entry, info)
         else:
@@ -1856,7 +1931,7 @@ def _breakup_wall(wall, show_alert=True):
     except Exception:
         wall_type_id = None
 
-    joined_wall_ids = _collect_joined_wall_ids(wall, wall_type_id)
+    joined_wall_ids = []
 
     def _handle_failure(message, level='warning', status='error'):
         if show_alert:
@@ -1883,6 +1958,8 @@ def _breakup_wall(wall, show_alert=True):
     layer_data = [item for item in layer_data if item['width'] > _WIDTH_EPS]
     if not layer_data:
         return _handle_failure('Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id))
+
+    joined_wall_ids = _collect_joined_wall_ids(wall, wall_type_id, layer_data)
 
     hosted_instances = _collect_hosted_instances(wall)
     host_layer_info = None
