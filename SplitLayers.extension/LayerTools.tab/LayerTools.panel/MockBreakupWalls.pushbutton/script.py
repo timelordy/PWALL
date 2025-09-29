@@ -46,6 +46,7 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
+    WallJoinType,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -67,6 +68,12 @@ _OPENING_MARGIN = 0.0
 
 _CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
 _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
+_APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
+
+try:
+    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt
+except Exception:
+    _WALL_JOIN_TYPE_BUTT = None
 
 try:
     _TEXT_TYPE = unicode
@@ -459,6 +466,18 @@ def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_
     return entry
 
 
+def _apply_butt_join_type(wall):
+    if wall is None:
+        return
+    if _APPLY_WALL_JOIN_TYPE is None or _WALL_JOIN_TYPE_BUTT is None:
+        return
+    for end_idx in (0, 1):
+        try:
+            _APPLY_WALL_JOIN_TYPE(wall, end_idx, _WALL_JOIN_TYPE_BUTT)
+        except Exception:
+            continue
+
+
 def _join_two_walls(first_id, second_id, should_first_cut=None):
     if first_id is None or second_id is None:
         return False
@@ -505,6 +524,9 @@ def _join_two_walls(first_id, second_id, should_first_cut=None):
         doc.Regenerate()
     except Exception:
         pass
+
+    _apply_butt_join_type(first_wall)
+    _apply_butt_join_type(second_wall)
 
     return True
 
