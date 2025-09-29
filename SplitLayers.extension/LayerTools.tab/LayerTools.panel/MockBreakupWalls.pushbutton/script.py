@@ -46,7 +46,6 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
-    WallJoinType,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -69,9 +68,16 @@ _OPENING_MARGIN = 0.0
 _CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
 _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
 _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
+_ALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'AllowWallJoinAtEnd', None)
+_DISALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'DisallowWallJoinAtEnd', None)
 
 try:
-    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt
+    from Autodesk.Revit.DB import WallJoinType  # type: ignore
+except Exception:
+    WallJoinType = None
+
+try:
+    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt if WallJoinType is not None else None
 except Exception:
     _WALL_JOIN_TYPE_BUTT = None
 
@@ -476,6 +482,77 @@ def _apply_butt_join_type(wall):
             _APPLY_WALL_JOIN_TYPE(wall, end_idx, _WALL_JOIN_TYPE_BUTT)
         except Exception:
             continue
+
+
+def _ensure_join_controls(wall):
+    if wall is None or _ALLOW_WALL_JOIN_AT_END is None:
+        return
+    for end_idx in (0, 1):
+        try:
+            _ALLOW_WALL_JOIN_AT_END(wall, end_idx)
+        except Exception:
+            continue
+
+
+def _suppress_auto_join(wall):
+    if wall is None or _DISALLOW_WALL_JOIN_AT_END is None:
+        return False
+    success = False
+    for end_idx in (0, 1):
+        try:
+            _DISALLOW_WALL_JOIN_AT_END(wall, end_idx)
+            success = True
+        except Exception:
+            continue
+    return success
+
+
+def _unjoin_two_walls(first_wall, second_wall):
+    if first_wall is None or second_wall is None:
+        return False
+    first_id = getattr(getattr(first_wall, 'Id', None), 'IntegerValue', None)
+    second_id = getattr(getattr(second_wall, 'Id', None), 'IntegerValue', None)
+    if first_id is not None and second_id is not None and first_id == second_id:
+        return False
+    try:
+        JoinGeometryUtils.UnjoinGeometry(doc, first_wall, second_wall)
+        return True
+    except Exception:
+        return False
+
+
+def _prepare_wall_for_manual_join(wall, existing_walls=None, host_wall=None):
+    if wall is None:
+        return
+
+    _ensure_join_controls(wall)
+    _suppress_auto_join(wall)
+
+    neighbors = []
+    if existing_walls:
+        for candidate in existing_walls:
+            if candidate is None:
+                continue
+            cand_id = getattr(getattr(candidate, 'Id', None), 'IntegerValue', None)
+            wall_id = getattr(getattr(wall, 'Id', None), 'IntegerValue', None)
+            if cand_id is not None and wall_id is not None and cand_id == wall_id:
+                continue
+            neighbors.append(candidate)
+
+    if host_wall is not None:
+        host_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
+        wall_id = getattr(getattr(wall, 'Id', None), 'IntegerValue', None)
+        if host_id is None or wall_id is None or host_id != wall_id:
+            neighbors.append(host_wall)
+
+    if neighbors:
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
+
+    for neighbor in neighbors:
+        _unjoin_two_walls(wall, neighbor)
 
 
 def _join_two_walls(first_id, second_id, should_first_cut=None):
@@ -2097,6 +2174,9 @@ def _breakup_wall(wall, show_alert=True):
     t = Transaction(doc, 'Разделение стены на слои')
     t.Start()
     try:
+        _ensure_join_controls(wall)
+        _suppress_auto_join(wall)
+
         for layer_info in layer_data:
             layer_type = _clone_wall_type_for_layer(wall.WallType, layer_info)
             if layer_type is None:
@@ -2131,15 +2211,12 @@ def _breakup_wall(wall, show_alert=True):
             except Exception:
                 pass
 
-            for end_idx in (0, 1):
-                try:
-                    WallUtils.AllowWallJoinAtEnd(new_wall, end_idx)
-                except Exception:
-                    pass
-
+            existing_parts = list(created_walls)
             created_walls.append(new_wall)
             produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
             logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
+
+            _prepare_wall_for_manual_join(new_wall, existing_parts, wall)
 
         if not created_walls:
             t.RollBack()
@@ -2190,10 +2267,11 @@ def _breakup_wall(wall, show_alert=True):
 
         for i in range(len(created_walls)):
             for j in range(i + 1, len(created_walls)):
-                try:
-                    JoinGeometryUtils.JoinGeometry(doc, created_walls[i], created_walls[j])
-                except Exception:
-                    pass
+                first_id = getattr(created_walls[i], 'Id', None)
+                second_id = getattr(created_walls[j], 'Id', None)
+                if first_id is None or second_id is None:
+                    continue
+                _join_two_walls(first_id, second_id)
 
         try:
             doc.Regenerate()
