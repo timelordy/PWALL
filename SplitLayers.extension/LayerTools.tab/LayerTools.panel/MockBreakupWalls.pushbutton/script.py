@@ -46,7 +46,6 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
-    WallJoinType,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -71,7 +70,12 @@ _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', Non
 _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
 
 try:
-    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt
+    from Autodesk.Revit.DB import WallJoinType  # type: ignore
+except Exception:
+    WallJoinType = None
+
+try:
+    _WALL_JOIN_TYPE_BUTT = WallJoinType.Butt if WallJoinType is not None else None
 except Exception:
     _WALL_JOIN_TYPE_BUTT = None
 
