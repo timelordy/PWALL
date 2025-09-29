@@ -356,6 +356,67 @@ def _match_layer_by_signature(target_layer, candidates, used_ids):
     return None
 
 
+def _normalize_join_meta(meta):
+    result = {'self_cuts': None, 'allow_mismatch': False}
+    if isinstance(meta, dict):
+        if 'self_cuts' in meta:
+            result['self_cuts'] = meta.get('self_cuts')
+        if meta.get('allow_mismatch'):
+            result['allow_mismatch'] = True
+    return result
+
+
+def _entry_identity(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    wall_type_id = entry.get('wall_type_id')
+    try:
+        wall_type_key = int(wall_type_id) if wall_type_id is not None else None
+    except Exception:
+        wall_type_key = _element_id_to_int(wall_type_id)
+
+    layer_ids = []
+    for layer in entry.get('layers') or []:
+        layer_ids.append(_element_id_to_int((layer or {}).get('wall_id')))
+
+    if not layer_ids:
+        return None
+
+    return (wall_type_key, tuple(sorted(layer_ids)))
+
+
+def _enqueue_pending_join(target_wall_id, entry, meta):
+    if target_wall_id is None or not entry:
+        return
+
+    normalized_meta = _normalize_join_meta(meta)
+    identity = _entry_identity(entry)
+    if identity is None:
+        return
+
+    pending_items = _PENDING_LAYER_JOINS[target_wall_id]
+
+    for item in pending_items:
+        if isinstance(item, dict):
+            existing_entry = item.get('entry')
+            existing_meta = _normalize_join_meta(item.get('meta'))
+            existing_identity = item.get('identity')
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            existing_entry, existing_meta = item
+            existing_identity = _entry_identity(existing_entry)
+            existing_meta = _normalize_join_meta(existing_meta)
+        else:
+            existing_entry = item
+            existing_meta = _normalize_join_meta(None)
+            existing_identity = _entry_identity(existing_entry)
+
+        if existing_identity == identity and existing_meta == normalized_meta:
+            return
+
+    pending_items.append({'entry': entry, 'meta': normalized_meta, 'identity': identity})
+
+
 def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_type_id=None):
     if not isinstance(wall, Wall):
         return None
@@ -626,7 +687,10 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
 
     pending_entries = _PENDING_LAYER_JOINS.pop(original_wall_id, [])
     for pending_item in pending_entries:
-        if isinstance(pending_item, (list, tuple)) and len(pending_item) == 2:
+        if isinstance(pending_item, dict):
+            pending_entry = pending_item.get('entry')
+            pending_meta = pending_item.get('meta')
+        elif isinstance(pending_item, (list, tuple)) and len(pending_item) == 2:
             pending_entry, pending_meta = pending_item
         else:
             pending_entry = pending_item
@@ -644,8 +708,7 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
             neighbour_entry = _LAYER_JOIN_CACHE.get(neighbour_id)
         if neighbour_entry:
             _attempt_layer_joins(entry, neighbour_entry, info)
-        else:
-            _PENDING_LAYER_JOINS[neighbour_id].append((entry, _invert_join_meta(info)))
+        _enqueue_pending_join(neighbour_id, entry, _invert_join_meta(info))
 
 
 class _LayerChoice(object):
