@@ -1314,6 +1314,7 @@ def _collect_target_walls():
 
 def _structure_layers_data(structure):
     layer_items = _layers_to_sequence(structure.GetLayers())
+    layer_count = len(layer_items)
     first_core = getattr(structure, 'GetFirstCoreLayerIndex', lambda: -1)()
     last_core = getattr(structure, 'GetLastCoreLayerIndex', lambda: -1)()
 
@@ -1378,6 +1379,8 @@ def _structure_layers_data(structure):
             'material_id': material_id,
             'function': function,
             'is_core': is_core,
+            'is_first': idx == 0,
+            'is_last': idx == (layer_count - 1),
         })
 
     total_width = position
@@ -2282,6 +2285,11 @@ def _breakup_wall(wall, show_alert=True):
 
     layer_data, total_width, core_start, core_end = _structure_layers_data(structure)
     layer_data = [item for item in layer_data if item['width'] > _WIDTH_EPS]
+    if layer_data:
+        last_index = len(layer_data) - 1
+        for idx, item in enumerate(layer_data):
+            item['is_first'] = idx == 0
+            item['is_last'] = idx == last_index
     if not layer_data:
         return _handle_failure('Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id))
 
@@ -2351,7 +2359,12 @@ def _breakup_wall(wall, show_alert=True):
             layer_info['offset'] = offset_center
             layer_info['reference_offset'] = context['reference_offset']
             translation_vector = _scale_vector(inward, offset_center)
-            adjusted_curve = _shrink_curve(base_curve, layer_info.get('width')) or base_curve
+            layer_width = layer_info.get('width')
+            if layer_info.get('is_first') or layer_info.get('is_last'):
+                shrink_distance = 0.0
+            else:
+                shrink_distance = layer_width
+            adjusted_curve = _shrink_curve(base_curve, shrink_distance) or base_curve
             placement_curve = adjusted_curve.CreateTransformed(
                 Transform.CreateTranslation(translation_vector)
             )
