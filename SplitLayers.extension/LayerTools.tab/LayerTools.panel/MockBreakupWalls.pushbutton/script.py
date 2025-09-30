@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Разбивает составную стену на отдельные стены-слои, автоматически создавая тип для каждого слоя."""
 
+import math
+
 import clr
 
 clr.AddReference('RevitAPI')
@@ -555,6 +557,105 @@ def _prepare_wall_for_manual_join(wall, existing_walls=None, host_wall=None):
         _unjoin_two_walls(wall, neighbor)
 
 
+def _determine_join_configuration(first_wall, second_wall, tolerance=0.1):
+    if first_wall is None or second_wall is None:
+        return None
+
+    first_location = getattr(first_wall, 'Location', None)
+    second_location = getattr(second_wall, 'Location', None)
+    if not isinstance(first_location, LocationCurve) or not isinstance(second_location, LocationCurve):
+        return None
+
+    first_curve = first_location.Curve
+    second_curve = second_location.Curve
+    if first_curve is None or second_curve is None:
+        return None
+
+    endpoints_first = []
+    endpoints_second = []
+
+    for idx in (0, 1):
+        try:
+            endpoints_first.append(first_curve.GetEndPoint(idx))
+        except Exception:
+            endpoints_first.append(None)
+        try:
+            endpoints_second.append(second_curve.GetEndPoint(idx))
+        except Exception:
+            endpoints_second.append(None)
+
+    closest_pair = None
+    for idx_a, point_a in enumerate(endpoints_first):
+        if point_a is None:
+            continue
+        for idx_b, point_b in enumerate(endpoints_second):
+            if point_b is None:
+                continue
+            try:
+                distance = point_a.DistanceTo(point_b)
+            except Exception:
+                continue
+            if closest_pair is None or distance < closest_pair[0]:
+                closest_pair = (distance, idx_a, idx_b)
+
+    if closest_pair is None:
+        return None
+
+    distance, first_end_idx, second_end_idx = closest_pair
+    if tolerance is not None and distance > tolerance:
+        return None
+
+    def _normalize_vector(vector):
+        if vector is None:
+            return None
+        try:
+            return vector.Normalize()
+        except Exception:
+            try:
+                length_sq = vector.DotProduct(vector)
+            except Exception:
+                length_sq = 0.0
+            if length_sq <= 0.0:
+                return None
+            length = math.sqrt(length_sq)
+            if length <= 0.0:
+                return None
+            return XYZ(vector.X / length, vector.Y / length, vector.Z / length)
+
+    try:
+        first_direction = _normalize_vector(first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0))
+    except Exception:
+        first_direction = None
+    try:
+        second_direction = _normalize_vector(second_curve.GetEndPoint(1) - second_curve.GetEndPoint(0))
+    except Exception:
+        second_direction = None
+
+    dot_product = None
+    if first_direction is not None and second_direction is not None:
+        try:
+            dot_product = first_direction.DotProduct(second_direction)
+        except Exception:
+            dot_product = None
+        else:
+            if dot_product < -1.0:
+                dot_product = -1.0
+            elif dot_product > 1.0:
+                dot_product = 1.0
+
+    join_type = 'angular'
+    if dot_product is not None and dot_product > 0.9:
+        join_type = 'linear'
+
+    return {
+        'type': join_type,
+        'first_end': first_end_idx,
+        'second_end': second_end_idx,
+        'dot_product': dot_product,
+        'distance': distance,
+    }
+
+
 def _join_two_walls(first_id, second_id, should_first_cut=None):
     if first_id is None or second_id is None:
         return False
@@ -571,10 +672,15 @@ def _join_two_walls(first_id, second_id, should_first_cut=None):
     except Exception:
         pass
 
+    join_configuration = _determine_join_configuration(first_wall, second_wall)
+
     for end_idx in (0, 1):
         for wall_obj in (first_wall, second_wall):
             try:
-                WallUtils.AllowWallJoinAtEnd(wall_obj, end_idx)
+                if _ALLOW_WALL_JOIN_AT_END is not None:
+                    _ALLOW_WALL_JOIN_AT_END(wall_obj, end_idx)
+                else:
+                    WallUtils.AllowWallJoinAtEnd(wall_obj, end_idx)
             except Exception:
                 pass
 
@@ -604,6 +710,20 @@ def _join_two_walls(first_id, second_id, should_first_cut=None):
 
     _apply_butt_join_type(first_wall)
     _apply_butt_join_type(second_wall)
+
+    if join_configuration and join_configuration.get('type') == 'angular':
+        for wall_obj, end_key in ((first_wall, 'first_end'), (second_wall, 'second_end')):
+            end_idx = join_configuration.get(end_key)
+            if end_idx not in (0, 1):
+                continue
+            opposite_idx = 1 - end_idx
+            try:
+                if _DISALLOW_WALL_JOIN_AT_END is not None:
+                    _DISALLOW_WALL_JOIN_AT_END(wall_obj, opposite_idx)
+                else:
+                    WallUtils.DisallowWallJoinAtEnd(wall_obj, opposite_idx)
+            except Exception:
+                pass
 
     return True
 
