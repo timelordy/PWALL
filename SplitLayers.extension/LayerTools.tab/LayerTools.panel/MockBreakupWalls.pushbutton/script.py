@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """Разбивает составную стену на отдельные стены-слои, автоматически создавая тип для каждого слоя."""
 
-import math
-
 import clr
 
 clr.AddReference('RevitAPI')
@@ -48,7 +46,6 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
-    Line,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -558,329 +555,7 @@ def _prepare_wall_for_manual_join(wall, existing_walls=None, host_wall=None):
         _unjoin_two_walls(wall, neighbor)
 
 
-def _find_nearby_walls_at_ends(wall, tolerance_distance=1.0):
-    """Находит стены, у которых концы находятся рядом с концами данной стены (в пределах tolerance_distance)"""
-    if wall is None:
-        return []
-
-    location = getattr(wall, 'Location', None)
-    if not isinstance(location, LocationCurve):
-        return []
-
-    curve = location.Curve
-    if curve is None:
-        return []
-
-    try:
-        wall_start = curve.GetEndPoint(0)
-        wall_end = curve.GetEndPoint(1)
-    except Exception:
-        return []
-
-    wall_endpoints = [wall_start, wall_end]
-
-    all_walls = FilteredElementCollector(doc).OfClass(Wall).ToElements()
-
-    nearby_walls = []
-    wall_id = wall.Id.IntegerValue
-
-    for candidate in all_walls:
-        if candidate is None or candidate.Id.IntegerValue == wall_id:
-            continue
-
-        cand_location = getattr(candidate, 'Location', None)
-        if not isinstance(cand_location, LocationCurve):
-            continue
-
-        cand_curve = cand_location.Curve
-        if cand_curve is None:
-            continue
-
-        try:
-            cand_start = cand_curve.GetEndPoint(0)
-            cand_end = cand_curve.GetEndPoint(1)
-        except Exception:
-            continue
-
-        candidate_endpoints = [cand_start, cand_end]
-
-        is_nearby = False
-        for wall_pt in wall_endpoints:
-            for cand_pt in candidate_endpoints:
-                distance = wall_pt.DistanceTo(cand_pt)
-                if distance <= tolerance_distance:
-                    is_nearby = True
-                    break
-            if is_nearby:
-                break
-
-        if is_nearby:
-            nearby_walls.append(candidate)
-
-    return nearby_walls
-
-
-def _match_layer_by_material_and_width(target_layer_info, candidate_walls, tolerance=0.01):
-    """Находит стену с таким же материалом и толщиной слоя"""
-    if not candidate_walls:
-        return []
-
-    target_material_id = _element_id_to_int(target_layer_info.get('material_id'))
-    target_width = target_layer_info.get('width', 0.0)
-
-    matched = []
-
-    for candidate in candidate_walls:
-        if not isinstance(candidate, Wall):
-            continue
-
-        try:
-            wall_type = candidate.WallType
-            structure = wall_type.GetCompoundStructure()
-        except Exception:
-            continue
-
-        if not structure:
-            continue
-
-        layer_items = _layers_to_sequence(structure.GetLayers())
-
-        for idx, layer in enumerate(layer_items):
-            layer_width = getattr(layer, 'Width', None) or 0.0
-
-            if abs(layer_width - target_width) > tolerance:
-                continue
-
-            material_id = ElementId.InvalidElementId
-            for attr in ('MaterialId', 'LayerMaterialId'):
-                try:
-                    candidate_mat = getattr(layer, attr)
-                except Exception:
-                    candidate_mat = None
-
-                if (
-                    candidate_mat
-                    and isinstance(candidate_mat, ElementId)
-                    and candidate_mat.IntegerValue > 0
-                ):
-                    material_id = candidate_mat
-                    break
-
-            if material_id is None or material_id.IntegerValue < 1:
-                try:
-                    material_id = structure.GetMaterialId(idx)
-                except Exception:
-                    material_id = ElementId.InvalidElementId
-
-            candidate_material_id = _element_id_to_int(material_id)
-
-            if target_material_id == candidate_material_id:
-                matched.append(candidate)
-                break
-
-    return matched
-
-
-def _align_wall_endpoints(target_wall, reference_wall, tolerance=0.1):
-    """Выравнивает концы целевой стены к концам референсной стены для точного совмещения слоёв"""
-    if target_wall is None or reference_wall is None:
-        return False
-
-    target_loc = getattr(target_wall, 'Location', None)
-    ref_loc = getattr(reference_wall, 'Location', None)
-
-    if not isinstance(target_loc, LocationCurve) or not isinstance(ref_loc, LocationCurve):
-        return False
-
-    target_curve = target_loc.Curve
-    ref_curve = ref_loc.Curve
-
-    if target_curve is None or ref_curve is None:
-        return False
-
-    try:
-        target_start = target_curve.GetEndPoint(0)
-        target_end = target_curve.GetEndPoint(1)
-        ref_start = ref_curve.GetEndPoint(0)
-        ref_end = ref_curve.GetEndPoint(1)
-    except Exception:
-        return False
-
-    ref_endpoints = [ref_start, ref_end]
-
-    new_start = target_start
-    new_end = target_end
-    modified = False
-
-    for ref_pt in ref_endpoints:
-        dist_to_start = target_start.DistanceTo(ref_pt)
-        dist_to_end = target_end.DistanceTo(ref_pt)
-
-        if dist_to_start <= tolerance and dist_to_start > 1e-6:
-            new_start = ref_pt
-            modified = True
-
-        if dist_to_end <= tolerance and dist_to_end > 1e-6:
-            new_end = ref_pt
-            modified = True
-
-    if not modified:
-        return False
-
-    try:
-        new_curve = Line.CreateBound(new_start, new_end)
-        target_loc.Curve = new_curve
-        return True
-    except Exception as exc:
-        logger.debug('Не удалось выровнять стену %s: %s', target_wall.Id.IntegerValue, exc)
-        return False
-
-
-def _auto_join_with_nearby_layers(produced_layers, tolerance_distance=1.0):
-    if not produced_layers:
-        return
-
-    for record in produced_layers:
-        wall = record.get('wall')
-        layer_info = record.get('info')
-
-        if wall is None or not layer_info:
-            continue
-
-        nearby_walls = _find_nearby_walls_at_ends(wall, tolerance_distance)
-
-        if not nearby_walls:
-            continue
-
-        matched_walls = _match_layer_by_material_and_width(layer_info, nearby_walls)
-
-        for matched_wall in matched_walls:
-            try:
-                aligned = _align_wall_endpoints(wall, matched_wall, tolerance=tolerance_distance)
-
-                if aligned:
-                    logger.debug(
-                        'Выровнены концы слоя %s (стена %s) с стеной %s',
-                        layer_info.get('index'),
-                        wall.Id.IntegerValue,
-                        matched_wall.Id.IntegerValue
-                    )
-
-                _join_two_walls(wall.Id, matched_wall.Id, should_first_cut=None, prevent_extension=True)
-                logger.debug(
-                    'Соединён слой %s (стена %s) с найденной стеной %s',
-                    layer_info.get('index'),
-                    wall.Id.IntegerValue,
-                    matched_wall.Id.IntegerValue
-                )
-            except Exception as exc:
-                logger.debug(
-                    'Не удалось соединить слой %s с стеной %s: %s',
-                    layer_info.get('index'),
-                    matched_wall.Id.IntegerValue,
-                    exc
-                )
-                
-def _determine_join_configuration(first_wall, second_wall, tolerance=0.1):
-    if first_wall is None or second_wall is None:
-        return None
-
-    first_location = getattr(first_wall, 'Location', None)
-    second_location = getattr(second_wall, 'Location', None)
-    if not isinstance(first_location, LocationCurve) or not isinstance(second_location, LocationCurve):
-        return None
-
-    first_curve = first_location.Curve
-    second_curve = second_location.Curve
-    if first_curve is None or second_curve is None:
-        return None
-
-    endpoints_first = []
-    endpoints_second = []
-
-    for idx in (0, 1):
-        try:
-            endpoints_first.append(first_curve.GetEndPoint(idx))
-        except Exception:
-            endpoints_first.append(None)
-        try:
-            endpoints_second.append(second_curve.GetEndPoint(idx))
-        except Exception:
-            endpoints_second.append(None)
-
-    closest_pair = None
-    for idx_a, point_a in enumerate(endpoints_first):
-        if point_a is None:
-            continue
-        for idx_b, point_b in enumerate(endpoints_second):
-            if point_b is None:
-                continue
-            try:
-                distance = point_a.DistanceTo(point_b)
-            except Exception:
-                continue
-            if closest_pair is None or distance < closest_pair[0]:
-                closest_pair = (distance, idx_a, idx_b)
-
-    if closest_pair is None:
-        return None
-
-    distance, first_end_idx, second_end_idx = closest_pair
-    if tolerance is not None and distance > tolerance:
-        return None
-
-    def _normalize_vector(vector):
-        if vector is None:
-            return None
-        try:
-            return vector.Normalize()
-        except Exception:
-            try:
-                length_sq = vector.DotProduct(vector)
-            except Exception:
-                length_sq = 0.0
-            if length_sq <= 0.0:
-                return None
-            length = math.sqrt(length_sq)
-            if length <= 0.0:
-                return None
-            return XYZ(vector.X / length, vector.Y / length, vector.Z / length)
-
-    try:
-        first_direction = _normalize_vector(first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0))
-    except Exception:
-        first_direction = None
-    try:
-        second_direction = _normalize_vector(second_curve.GetEndPoint(1) - second_curve.GetEndPoint(0))
-    except Exception:
-        second_direction = None
-
-    dot_product = None
-    if first_direction is not None and second_direction is not None:
-        try:
-            dot_product = first_direction.DotProduct(second_direction)
-        except Exception:
-            dot_product = None
-        else:
-            if dot_product < -1.0:
-                dot_product = -1.0
-            elif dot_product > 1.0:
-                dot_product = 1.0
-
-    join_type = 'angular'
-    if dot_product is not None and dot_product > 0.9:
-        join_type = 'linear'
-
-    return {
-        'type': join_type,
-        'first_end': first_end_idx,
-        'second_end': second_end_idx,
-        'dot_product': dot_product,
-        'distance': distance,
-    }
-
-
-def _join_two_walls(first_id, second_id, should_first_cut=None, prevent_extension=False):
+def _join_two_walls(first_id, second_id, should_first_cut=None):
     if first_id is None or second_id is None:
         return False
     try:
@@ -896,42 +571,12 @@ def _join_two_walls(first_id, second_id, should_first_cut=None, prevent_extensio
     except Exception:
         pass
 
-    join_configuration = _determine_join_configuration(first_wall, second_wall)
-
-    if (
-        join_configuration
-        and prevent_extension
-        and join_configuration.get('type') == 'angular'
-    ):
-        ends_to_allow = (
-            (first_wall, join_configuration.get('first_end')),
-            (second_wall, join_configuration.get('second_end')),
-        )
-        for wall_obj, join_end in ends_to_allow:
-            for end_idx in (0, 1):
-                try:
-                    if end_idx == join_end:
-                        if _ALLOW_WALL_JOIN_AT_END is not None:
-                            _ALLOW_WALL_JOIN_AT_END(wall_obj, end_idx)
-                        else:
-                            WallUtils.AllowWallJoinAtEnd(wall_obj, end_idx)
-                    else:
-                        if _DISALLOW_WALL_JOIN_AT_END is not None:
-                            _DISALLOW_WALL_JOIN_AT_END(wall_obj, end_idx)
-                        else:
-                            WallUtils.DisallowWallJoinAtEnd(wall_obj, end_idx)
-                except Exception:
-                    pass
-    else:
-        for end_idx in (0, 1):
-            for wall_obj in (first_wall, second_wall):
-                try:
-                    if _ALLOW_WALL_JOIN_AT_END is not None:
-                        _ALLOW_WALL_JOIN_AT_END(wall_obj, end_idx)
-                    else:
-                        WallUtils.AllowWallJoinAtEnd(wall_obj, end_idx)
-                except Exception:
-                    pass
+    for end_idx in (0, 1):
+        for wall_obj in (first_wall, second_wall):
+            try:
+                WallUtils.AllowWallJoinAtEnd(wall_obj, end_idx)
+            except Exception:
+                pass
 
     try:
         JoinGeometryUtils.JoinGeometry(doc, first_wall, second_wall)
@@ -959,20 +604,6 @@ def _join_two_walls(first_id, second_id, should_first_cut=None, prevent_extensio
 
     _apply_butt_join_type(first_wall)
     _apply_butt_join_type(second_wall)
-
-    if join_configuration and join_configuration.get('type') == 'angular':
-        for wall_obj, end_key in ((first_wall, 'first_end'), (second_wall, 'second_end')):
-            end_idx = join_configuration.get(end_key)
-            if end_idx not in (0, 1):
-                continue
-            opposite_idx = 1 - end_idx
-            try:
-                if _DISALLOW_WALL_JOIN_AT_END is not None:
-                    _DISALLOW_WALL_JOIN_AT_END(wall_obj, opposite_idx)
-                else:
-                    WallUtils.DisallowWallJoinAtEnd(wall_obj, opposite_idx)
-            except Exception:
-                pass
 
     return True
 
@@ -1177,8 +808,6 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
         if neighbour_entry:
             _attempt_layer_joins(entry, neighbour_entry, info)
         _enqueue_pending_join(neighbour_id, entry, _invert_join_meta(info))
-
-    _auto_join_with_nearby_layers(produced_layers, tolerance_distance=1.0)
 
 
 class _LayerChoice(object):
