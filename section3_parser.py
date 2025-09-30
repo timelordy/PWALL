@@ -329,9 +329,31 @@ def _build_lookup() -> Dict[str, str]:
 HEADER_LOOKUP = _build_lookup()
 
 
+def identify_section3_field(header: object) -> Optional[str]:
+    """Возвращает имя поля раздела 3, соответствующее заголовку.
+
+    Функция принимает исходный заголовок таблицы и пытается определить,
+    какое поле раздела 3 он описывает.  Если сопоставление выполнить не
+    удалось, возвращается ``None``.  Логика полностью повторяет ту, что
+    используется внутри :func:`extract_section3_rows`.
+    """
+
+    normalized = _normalize_header(header)
+    if not normalized:
+        return None
+
+    match = _match_field(normalized)
+    if match is None:
+        return None
+
+    field, _priority = match
+    return field
+
+
 __all__ = [
     "SECTION3_FIELDS",
     "NUMERIC_FIELDS",
     "extract_section3_rows",
+    "identify_section3_field",
 ]
 
