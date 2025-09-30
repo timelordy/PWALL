@@ -1896,8 +1896,26 @@ def _ensure_orientation_vector(context, curve):
 
 def _collect_hosted_instances(wall):
     hosted = []
-    fi_collector = FilteredElementCollector(doc).OfClass(FamilyInstance)
-    for inst in fi_collector:
+    try:
+        dependent_ids = wall.GetDependentElements(ElementClassFilter(FamilyInstance))
+    except Exception as exc:
+        logger.debug(
+            'Не удалось получить зависимые семейства для стены %s: %s',
+            _element_id_to_int(getattr(wall, 'Id', None)),
+            exc,
+        )
+        dependent_ids = []
+
+    for inst_id in dependent_ids:
+        inst = doc.GetElement(inst_id)
+        if inst is None:
+            logger.warning(
+                'Зависимый элемент %s для стены %s не найден или был удалён.',
+                _element_id_to_int(inst_id),
+                _element_id_to_int(getattr(wall, 'Id', None)),
+            )
+            continue
+
         host = getattr(inst, 'Host', None)
         if host is None or host.Id != wall.Id:
             continue
