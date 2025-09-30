@@ -2498,10 +2498,21 @@ def _breakup_wall(wall, show_alert=True):
             layer_info['reference_offset'] = context['reference_offset']
             translation_vector = _scale_vector(inward, offset_center)
             layer_width = layer_info.get('width')
-            if layer_info.get('is_first') or layer_info.get('is_last'):
-                shrink_distance = 0.0
-            else:
+
+            # Ранее первый и последний слои не укорачивались вовсе, поэтому в
+            # Г-образных соединениях они вытягивались до общей длины и
+            # пересекались с перпендикулярной стеной. Пользователь ожидает, что
+            # *каждый* слой будет недоведён до угла на толщину самого слоя,
+            # чтобы при стыковке двух одинаковых стен их одноимённые слои
+            # корректно расходились и не пересекались. Для однослойной стены
+            # оставляем исходное поведение (укорачивать нечего), а при количестве
+            # слоёв больше одного сокращаем стену на величину слоя независимо от
+            # его позиции.
+
+            if len(layer_data) > 1 and layer_width is not None:
                 shrink_distance = layer_width
+            else:
+                shrink_distance = 0.0
             adjusted_curve = _shrink_curve(base_curve, shrink_distance) or base_curve
             placement_curve = adjusted_curve.CreateTransformed(
                 Transform.CreateTranslation(translation_vector)
