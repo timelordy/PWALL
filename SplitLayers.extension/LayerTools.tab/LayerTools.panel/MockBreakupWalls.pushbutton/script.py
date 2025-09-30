@@ -1695,10 +1695,39 @@ def _make_signature(layer_info):
     return (round(layer_info['width'], 6), material_value, function_value)
 
 
+def _is_valid_element(element):
+    try:
+        return bool(element) and getattr(element, 'IsValidObject', False)
+    except Exception:
+        return False
+
+
+def _resolve_element(element_id):
+    if isinstance(element_id, int):
+        try:
+            element_id = ElementId(element_id)
+        except Exception:
+            return None
+
+    if not isinstance(element_id, ElementId):
+        return None
+    try:
+        if element_id is None or element_id == ElementId.InvalidElementId:
+            return None
+    except Exception:
+        return None
+    try:
+        return doc.GetElement(element_id)
+    except Exception:
+        return None
+
+
 def _find_existing_single_layer_type(signature):
     cached = _SIGNATURE_CACHE.get(signature)
-    if cached:
+    if cached and _is_valid_element(cached):
         return cached
+    elif cached:
+        _SIGNATURE_CACHE.pop(signature, None)
 
     width, material_value, function_value = signature
 
@@ -1770,6 +1799,12 @@ def _clone_wall_type_for_layer(source_type, layer_info):
     width = layer_info['width']
     width_mm = _feet_to_mm(width)
 
+    if not _is_valid_element(source_type):
+        source_type = _resolve_element(layer_info.get('source_type_id'))
+
+    if not _is_valid_element(source_type):
+        return None
+
     base_name = _get_element_name(source_type)
     if not base_name:
         base_name = u"Слой стены"
@@ -1809,7 +1844,8 @@ def _clone_wall_type_for_layer(source_type, layer_info):
         logger.warning('Не удалось пересобрать структуру типу "%s": %s', name, exc)
         return None
 
-    _SIGNATURE_CACHE[signature] = new_type
+    if _is_valid_element(new_type):
+        _SIGNATURE_CACHE[signature] = new_type
     return new_type
 
 
@@ -2512,6 +2548,9 @@ def _prepare_wall_job(wall, show_alert=True):
             show_alert=show_alert,
         )
 
+    for item in layer_data:
+        item['source_type_id'] = wall_type_id
+
     joined_wall_ids = _collect_joined_wall_ids(wall, wall_type_id, layer_data)
 
     hosted_instances = _collect_hosted_instances(wall)
@@ -2605,7 +2644,17 @@ def _create_wall_layer(job, layer_info):
     if not context:
         return False
 
-    layer_type = _clone_wall_type_for_layer(job.get('wall_type'), layer_info)
+    wall_type = job.get('wall_type')
+    if not _is_valid_element(wall_type):
+        wall_type = _resolve_element(job.get('wall_type_id'))
+        if wall_type is None:
+            logger.warning('Исходный тип стены для слоя %s недоступен', layer_info.get('index'))
+            return False
+        job['wall_type'] = wall_type
+
+    layer_info['source_type_id'] = getattr(wall_type, 'Id', None)
+
+    layer_type = _clone_wall_type_for_layer(wall_type, layer_info)
     if layer_type is None:
         return False
 
