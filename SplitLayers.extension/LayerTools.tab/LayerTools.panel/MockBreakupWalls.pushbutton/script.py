@@ -67,6 +67,11 @@ _PENDING_LAYER_JOINS = defaultdict(list)
 _OPENING_MARGIN = 0.0
 _OFFSET_TOLERANCE = 1e-4
 
+try:
+    _REVIT_MIN_DIMENSION = UnitUtils.ConvertToInternalUnits(1.0 / 32.0, UnitTypeId.Feet)
+except Exception:
+    _REVIT_MIN_DIMENSION = 1.0 / 32.0
+
 _CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
 _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
 _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
@@ -1752,6 +1757,49 @@ def _apply_vertical_constraints(wall, context):
         pass
 
 
+def _compute_wall_height_from_geometry(wall, curve=None):
+    heights = []
+
+    try:
+        bbox = wall.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+
+    if bbox is not None:
+        transform = getattr(bbox, 'Transform', None)
+        min_pt = bbox.Min
+        max_pt = bbox.Max
+        if transform is not None:
+            try:
+                min_pt = transform.OfPoint(min_pt)
+                max_pt = transform.OfPoint(max_pt)
+            except Exception:
+                pass
+        if min_pt is not None and max_pt is not None:
+            try:
+                heights.append(abs(max_pt.Z - min_pt.Z))
+            except Exception:
+                pass
+
+    if curve is None:
+        location = getattr(wall, 'Location', None)
+        if isinstance(location, LocationCurve):
+            curve = location.Curve
+
+    if curve is not None:
+        try:
+            start_z = curve.GetEndPoint(0).Z
+            end_z = curve.GetEndPoint(1).Z
+            heights.append(abs(end_z - start_z))
+        except Exception:
+            pass
+
+    valid_heights = [h for h in heights if h is not None and h > 0]
+    if valid_heights:
+        return max(valid_heights)
+    return None
+
+
 def _build_wall_context(wall, structure, total_width, core_start, core_end):
     location = getattr(wall, 'Location', None)
     if not isinstance(location, LocationCurve):
@@ -1767,7 +1815,44 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
 
     base_offset = wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET) else 0.0
     top_offset = wall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET) else 0.0
-    height = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM) else total_width
+
+    height = None
+    height_param = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+    if height_param is not None:
+        has_value = True
+        try:
+            has_value = height_param.HasValue
+        except Exception:
+            pass
+        if has_value:
+            try:
+                candidate_height = height_param.AsDouble()
+            except Exception:
+                candidate_height = None
+            if candidate_height is not None and candidate_height > 0:
+                height = candidate_height
+
+    if height is None or height <= 0:
+        geometry_height = _compute_wall_height_from_geometry(wall, curve)
+        if geometry_height is not None and geometry_height > 0:
+            height = geometry_height
+
+    if height is None or height <= 0:
+        logger.warning(
+            u'Высота стены %s недоступна или неположительна (%.4f). '
+            u'Используем минимальное допустимое значение Revit.',
+            wall.Id,
+            height or 0.0,
+        )
+        height = _REVIT_MIN_DIMENSION
+    elif height < _REVIT_MIN_DIMENSION:
+        logger.warning(
+            u'Высота стены %s (%.4f) меньше минимально допустимой. '
+            u'Используем минимальное значение Revit.',
+            wall.Id,
+            height,
+        )
+        height = _REVIT_MIN_DIMENSION
 
     flip = getattr(wall, 'Flipped', False)
     structural = getattr(wall, 'Structural', False)
