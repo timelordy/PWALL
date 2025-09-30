@@ -64,6 +64,7 @@ _SIGNATURE_CACHE = {}
 _LAYER_JOIN_CACHE = {}
 _PENDING_LAYER_JOINS = defaultdict(list)
 _OPENING_MARGIN = 0.0
+_OFFSET_TOLERANCE = 1e-4
 
 _CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
 _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
@@ -358,15 +359,79 @@ def _layer_signature_for_join(layer_info):
     return (material_key, width, function)
 
 
+def _get_layer_offset(layer):
+    if not isinstance(layer, dict):
+        return None
+    offset = layer.get('offset')
+    if offset is None:
+        start = layer.get('start')
+        end = layer.get('end')
+        if start is None or end is None:
+            return None
+        try:
+            offset = (float(start) + float(end)) / 2.0
+        except Exception:
+            return None
+        reference_offset = layer.get('reference_offset')
+        if reference_offset is not None:
+            try:
+                offset -= float(reference_offset)
+            except Exception:
+                pass
+    try:
+        return float(offset)
+    except Exception:
+        return None
+
+
+def _offset_difference(layer_a, layer_b):
+    offset_a = _get_layer_offset(layer_a)
+    offset_b = _get_layer_offset(layer_b)
+    if offset_a is None or offset_b is None:
+        return None
+    try:
+        return abs(offset_a - offset_b)
+    except Exception:
+        return None
+
+
+def _offsets_compatible(layer_a, layer_b, tolerance=_OFFSET_TOLERANCE):
+    diff = _offset_difference(layer_a, layer_b)
+    if diff is None:
+        return True
+    return diff <= tolerance
+
+
 def _match_layer_by_signature(target_layer, candidates, used_ids):
     target_signature = _layer_signature_for_join(target_layer)
+    target_offset = _get_layer_offset(target_layer)
+    best_candidate = None
+    best_diff = None
+
     for candidate in candidates:
         candidate_id = _element_id_to_int(candidate.get('wall_id'))
         if candidate_id in used_ids:
             continue
-        if _layer_signature_for_join(candidate) == target_signature:
+        if _layer_signature_for_join(candidate) != target_signature:
+            continue
+
+        if target_offset is None:
             return candidate
-    return None
+
+        diff = _offset_difference(target_layer, candidate)
+        if diff is not None and diff <= _OFFSET_TOLERANCE:
+            return candidate
+
+        if diff is None:
+            if best_candidate is None:
+                best_candidate = candidate
+            continue
+
+        if best_diff is None or diff < best_diff:
+            best_candidate = candidate
+            best_diff = diff
+
+    return best_candidate
 
 
 def _normalize_join_meta(meta):
@@ -438,7 +503,14 @@ def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_
     if not layers:
         return None
 
-    layer_data, _, _, _ = _structure_layers_data(structure)
+    layer_data, total_width, core_start, core_end = _structure_layers_data(structure)
+    try:
+        context = _build_wall_context(wall, structure, total_width, core_start, core_end)
+    except Exception:
+        context = {}
+    reference_offset = context.get('reference_offset')
+    if reference_offset is None:
+        reference_offset = total_width / 2.0 if total_width is not None else None
     filtered_layers = []
     for info in layer_data:
         width = info.get('width', 0.0) or 0.0
@@ -448,12 +520,28 @@ def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_
             signature = _layer_signature_for_join(info)
             if signature not in expected_signatures:
                 continue
+        start = info.get('start')
+        end = info.get('end')
+        center = None
+        if start is not None and end is not None:
+            try:
+                center = (float(start) + float(end)) / 2.0
+            except Exception:
+                center = None
+        offset = None
+        if center is not None and reference_offset is not None:
+            try:
+                offset = center - float(reference_offset)
+            except Exception:
+                offset = None
         filtered_layers.append({
             'index': info.get('index'),
             'function': info.get('function'),
             'width': width,
             'material_id': info.get('material_id'),
             'wall_id': wall.Id,
+            'offset': offset,
+            'reference_offset': reference_offset,
         })
 
     if not filtered_layers:
@@ -637,6 +725,12 @@ def _attempt_layer_joins(entry_a, entry_b, join_meta=None):
         layer_b = layers_b_by_index.get(layer_a.get('index'))
         if layer_b is None or _element_id_to_int(layer_b.get('wall_id')) in used_b:
             layer_b = _match_layer_by_signature(layer_a, layers_b, used_b)
+        elif not _offsets_compatible(layer_a, layer_b):
+            temp_used = set(used_b)
+            candidate_id = _element_id_to_int(layer_b.get('wall_id'))
+            if candidate_id is not None:
+                temp_used.add(candidate_id)
+            layer_b = _match_layer_by_signature(layer_a, layers_b, temp_used)
         if layer_b is None:
             continue
 
@@ -766,12 +860,20 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
         wall = record.get('wall')
         if wall is None:
             continue
+        offset = record.get('offset')
+        if offset is None:
+            offset = info.get('offset')
+        reference_offset = record.get('reference_offset')
+        if reference_offset is None:
+            reference_offset = info.get('reference_offset')
         layer_records.append({
             'index': info.get('index'),
             'function': info.get('function'),
             'width': info.get('width', 0.0),
             'material_id': info.get('material_id'),
             'wall_id': wall.Id,
+            'offset': offset,
+            'reference_offset': reference_offset,
         })
 
     if not layer_records:
@@ -2184,6 +2286,8 @@ def _breakup_wall(wall, show_alert=True):
 
             layer_center = (layer_info['start'] + layer_info['end']) / 2.0
             offset_center = layer_center - context['reference_offset']
+            layer_info['offset'] = offset_center
+            layer_info['reference_offset'] = context['reference_offset']
             translation_vector = _scale_vector(inward, offset_center)
             placement_curve = base_curve.CreateTransformed(Transform.CreateTranslation(translation_vector))
 
@@ -2213,7 +2317,12 @@ def _breakup_wall(wall, show_alert=True):
 
             existing_parts = list(created_walls)
             created_walls.append(new_wall)
-            produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
+            produced_layers.append({
+                'wall': new_wall,
+                'info': dict(layer_info),
+                'offset': offset_center,
+                'reference_offset': context['reference_offset'],
+            })
             logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
 
             _prepare_wall_for_manual_join(new_wall, existing_parts, wall)
