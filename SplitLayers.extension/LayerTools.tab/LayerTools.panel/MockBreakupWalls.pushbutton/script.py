@@ -83,6 +83,21 @@ _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
 _ALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'AllowWallJoinAtEnd', None)
 _DISALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'DisallowWallJoinAtEnd', None)
 
+_ATTACHMENT_PARAM_CANDIDATES = {
+    'base': ('WALL_BASE_IS_ATTACHED', 'WALL_BASE_IS_ATTACHED_PARAM'),
+    'top': ('WALL_TOP_IS_ATTACHED', 'WALL_TOP_IS_ATTACHED_PARAM'),
+}
+_WALL_ATTACHMENT_PARAMS = {}
+for _attach_key, _name_candidates in _ATTACHMENT_PARAM_CANDIDATES.items():
+    for _param_name in _name_candidates:
+        try:
+            _param_value = getattr(BuiltInParameter, _param_name)
+        except Exception:
+            _param_value = None
+        if _param_value is not None:
+            _WALL_ATTACHMENT_PARAMS[_attach_key] = _param_value
+            break
+
 try:
     from Autodesk.Revit.DB import WallJoinType  # type: ignore
 except Exception:
@@ -248,6 +263,136 @@ def _get_param_double(element, param_id):
             return float(param.AsValueString())
         except Exception:
             return None
+
+
+def _get_param_bool(element, param_id):
+    if element is None or param_id is None:
+        return False
+    try:
+        param = element.get_Parameter(param_id)
+    except Exception:
+        param = None
+    if param is None:
+        return False
+    try:
+        if hasattr(param, 'HasValue') and not param.HasValue:
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(param.AsInteger())
+    except Exception:
+        pass
+    try:
+        return bool(param.AsDouble())
+    except Exception:
+        pass
+    try:
+        text = param.AsValueString()
+    except Exception:
+        text = None
+    if text:
+        lowered = text.strip().lower()
+        if lowered in ('1', 'true', 'yes', 'да', 'истина'):
+            return True
+    return False
+
+
+def _set_param_bool(element, param_id, state):
+    if element is None or param_id is None:
+        return False
+    try:
+        param = element.get_Parameter(param_id)
+    except Exception:
+        param = None
+    if param is None:
+        return False
+    if getattr(param, 'IsReadOnly', True):
+        return False
+    try:
+        param.Set(1 if state else 0)
+        return True
+    except Exception:
+        pass
+    try:
+        param.Set(bool(state))
+        return True
+    except Exception:
+        return False
+
+
+def _try_detach_wall_end(wall, detach_top):
+    if wall is None:
+        return False
+
+    detached = False
+    method_names = ('DetachTop', 'DetachTopAndLockHeight') if detach_top else ('DetachBottom', 'DetachBase')
+    for name in method_names:
+        method = getattr(wall, name, None)
+        if not callable(method):
+            continue
+        for args in ((), (doc,),):
+            try:
+                method(*args)
+                detached = True
+                break
+            except TypeError:
+                continue
+            except Exception:
+                break
+        if detached:
+            break
+
+    if detached:
+        return True
+
+    detach_utils = getattr(WallUtils, 'DetachWall', None)
+    if callable(detach_utils):
+        candidates = [
+            (doc, wall),
+            (doc, wall.Id),
+            (doc, wall, detach_top),
+            (doc, wall.Id, detach_top),
+        ]
+        for args in candidates:
+            try:
+                detach_utils(*args)
+                detached = True
+                break
+            except TypeError:
+                continue
+            except Exception:
+                break
+
+    return detached
+
+
+def _reset_wall_attachment_flags(wall, context=None):
+    if wall is None:
+        return False
+
+    changed = False
+    if context is None:
+        context = {}
+
+    for key in ('base', 'top'):
+        param_id = _WALL_ATTACHMENT_PARAMS.get(key)
+        if param_id is None:
+            continue
+
+        state_key = '{}_attached'.format(key)
+        should_detach = context.get(state_key)
+        if should_detach is False:
+            continue
+
+        if should_detach:
+            if _try_detach_wall_end(wall, detach_top=(key == 'top')):
+                changed = True
+
+        if _set_param_bool(wall, param_id, False):
+            changed = True
+
+    return changed
 
 
 def _get_instance_clear_width(instance):
@@ -2128,6 +2273,9 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
 
     reference_offset = _reference_offset(location_line, total_width, core_start, core_end)
 
+    base_attached = _get_param_bool(wall, _WALL_ATTACHMENT_PARAMS.get('base'))
+    top_attached = _get_param_bool(wall, _WALL_ATTACHMENT_PARAMS.get('top'))
+
     return {
         'curve': curve,
         'base_level_id': base_level_id if base_level_id and base_level_id.IntegerValue > 0 else wall.LevelId,
@@ -2140,6 +2288,8 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
         'location_line': location_line,
         'orientation': orientation,
         'reference_offset': reference_offset,
+        'base_attached': base_attached,
+        'top_attached': top_attached,
     }
 
 
@@ -2853,6 +3003,7 @@ def _create_wall_layer(job, layer_info):
             context['structural'],
         )
 
+        attachments_reset = _reset_wall_attachment_flags(new_wall, context)
         _apply_vertical_constraints(new_wall, context)
 
         try:
@@ -2871,6 +3022,13 @@ def _create_wall_layer(job, layer_info):
             'reference_offset': context['reference_offset'],
         })
         logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
+
+        if attachments_reset and (context.get('base_attached') or context.get('top_attached')):
+            logger.debug(
+                'Сброшены привязки верха/низа для стены %s (слой %s)',
+                new_wall.Id.IntegerValue,
+                layer_info['index'],
+            )
 
         _prepare_wall_for_manual_join(new_wall, existing_parts, wall)
 
