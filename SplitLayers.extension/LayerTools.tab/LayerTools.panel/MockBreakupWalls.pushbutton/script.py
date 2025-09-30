@@ -1814,39 +1814,80 @@ def _clone_wall_type_for_layer(source_type, layer_info):
     if not name:
         name = u"Layer_{}".format(layer_info['index'])
 
-    suffix = 1
-    while True:
-        try:
-            new_type = source_type.Duplicate(name)
-            break
-        except Exception:
-            suffix += 1
-            name = _sanitize_name(u"{} #{}".format(base_label, suffix))
-            if suffix > 50:
-                logger.warning('Не удалось дублировать тип для слоя %s', layer_info['index'])
-                return None
-
-    material_id = layer_info['material_id'] if layer_info['material_id'] else ElementId.InvalidElementId
-    function = layer_info.get('function') or MaterialFunctionAssignment.Finish1
+    started_transaction = False
+    transaction = None
+    try:
+        if not getattr(doc, 'IsModifiable', False):
+            transaction = Transaction(doc, 'Подготовка типа слоя стены')
+            transaction.Start()
+            started_transaction = True
+    except Exception:
+        transaction = None
 
     try:
-        new_layer = CompoundStructureLayer(width, function, material_id)
-        if hasattr(new_layer, 'IsCore'):
+        suffix = 1
+        while True:
             try:
-                new_layer.IsCore = layer_info.get('is_core', False)
+                new_type = source_type.Duplicate(name)
+                break
+            except Exception as exc:
+                suffix += 1
+                name = _sanitize_name(u"{} #{}".format(base_label, suffix))
+                if suffix > 50:
+                    logger.warning(
+                        'Не удалось дублировать тип для слоя %s: %s',
+                        layer_info['index'],
+                        exc,
+                    )
+                    if started_transaction and transaction:
+                        transaction.RollBack()
+                    return None
+
+        material_id = (
+            layer_info['material_id']
+            if layer_info['material_id']
+            else ElementId.InvalidElementId
+        )
+        function = layer_info.get('function') or MaterialFunctionAssignment.Finish1
+
+        try:
+            new_layer = CompoundStructureLayer(width, function, material_id)
+            if hasattr(new_layer, 'IsCore'):
+                try:
+                    new_layer.IsCore = layer_info.get('is_core', False)
+                except Exception:
+                    pass
+            layer_list = List[CompoundStructureLayer]()
+            layer_list.Add(new_layer)
+            comp = CompoundStructure.CreateSimpleCompoundStructure(layer_list)
+            new_type.SetCompoundStructure(comp)
+        except Exception as exc:
+            logger.warning('Не удалось пересобрать структуру типу "%s": %s', name, exc)
+            if started_transaction and transaction:
+                transaction.RollBack()
+            return None
+
+        if started_transaction and transaction:
+            try:
+                transaction.Commit()
+            except Exception as exc:
+                logger.warning('Не удалось зафиксировать создание типа слоя %s: %s', layer_info['index'], exc)
+                try:
+                    transaction.RollBack()
+                except Exception:
+                    pass
+                return None
+
+        if _is_valid_element(new_type):
+            _SIGNATURE_CACHE[signature] = new_type
+        return new_type
+    except Exception:
+        if started_transaction and transaction:
+            try:
+                transaction.RollBack()
             except Exception:
                 pass
-        layer_list = List[CompoundStructureLayer]()
-        layer_list.Add(new_layer)
-        comp = CompoundStructure.CreateSimpleCompoundStructure(layer_list)
-        new_type.SetCompoundStructure(comp)
-    except Exception as exc:
-        logger.warning('Не удалось пересобрать структуру типу "%s": %s', name, exc)
-        return None
-
-    if _is_valid_element(new_type):
-        _SIGNATURE_CACHE[signature] = new_type
-    return new_type
+        raise
 
 
 def _apply_vertical_constraints(wall, context):
@@ -2766,30 +2807,42 @@ def _finalize_wall_job(job, show_alert=None):
     selected_layer_index = job.get('selected_layer_index')
 
     host_wall = None
+    valid_layers = []
     for record in produced_layers:
         layer_info = record.get('info') or {}
         wall_part = record.get('wall')
-        if wall_part is None:
+        if not _is_valid_element(wall_part):
+            logger.debug(
+                'Стеновой элемент слоя %s недоступен и будет пропущен',
+                layer_info.get('index'),
+            )
             continue
+        valid_layers.append(record)
         if selected_layer_index is not None and layer_info.get('index') == selected_layer_index:
             host_wall = wall_part
             break
 
     if host_wall is None:
-        for record in produced_layers:
+        for record in valid_layers:
             layer_info = record.get('info') or {}
             wall_part = record.get('wall')
-            if wall_part is None:
-                continue
             if layer_info.get('function') == MaterialFunctionAssignment.Structure:
                 host_wall = wall_part
                 break
 
-    if host_wall is None:
-        host_wall = produced_layers[0]['wall']
+    if not valid_layers:
+        job['status'] = 'failed'
+        return _fail_breakup(
+            'Не удалось создать ни одной валидной разделённой стены для {}.'.format(wall_id),
+            wall_id,
+            show_alert=show_alert,
+        )
+
+    if host_wall is None and valid_layers:
+        host_wall = valid_layers[0]['wall']
 
     host_index = None
-    for idx, record in enumerate(produced_layers):
+    for idx, record in enumerate(valid_layers):
         wall_part = record.get('wall')
         if wall_part is not None and wall_part.Id == host_wall.Id:
             host_index = idx
@@ -2799,7 +2852,7 @@ def _finalize_wall_job(job, show_alert=None):
         host_index = 0
 
     preceding_walls = []
-    for idx, record in enumerate(produced_layers):
+    for idx, record in enumerate(valid_layers):
         wall_part = record.get('wall')
         if wall_part is None or wall_part.Id == host_wall.Id:
             continue
@@ -2811,7 +2864,7 @@ def _finalize_wall_job(job, show_alert=None):
     t.Start()
     try:
         host_wall_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
-        for record in produced_layers:
+        for record in valid_layers:
             wall_part = record.get('wall')
             if wall_part is None:
                 continue
@@ -2821,10 +2874,11 @@ def _finalize_wall_job(job, show_alert=None):
 
         _rehost_instances(job.get('hosted_instances'), host_wall, preceding_walls)
 
-        for i in range(len(created_walls)):
-            for j in range(i + 1, len(created_walls)):
-                first_id = getattr(created_walls[i], 'Id', None)
-                second_id = getattr(created_walls[j], 'Id', None)
+        filtered_created = [wall_part for wall_part in created_walls if _is_valid_element(wall_part)]
+        for i in range(len(filtered_created)):
+            for j in range(i + 1, len(filtered_created)):
+                first_id = getattr(filtered_created[i], 'Id', None)
+                second_id = getattr(filtered_created[j], 'Id', None)
                 if first_id is None or second_id is None:
                     continue
                 _join_two_walls(first_id, second_id)
@@ -2838,7 +2892,7 @@ def _finalize_wall_job(job, show_alert=None):
             _handle_layer_joins(
                 wall_id,
                 job.get('wall_type_id'),
-                produced_layers,
+                valid_layers,
                 job.get('joined_wall_ids'),
             )
         except Exception as exc:
