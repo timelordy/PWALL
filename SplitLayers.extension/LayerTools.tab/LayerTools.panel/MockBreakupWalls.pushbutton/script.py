@@ -917,15 +917,23 @@ class _LayerChoice(object):
     def __init__(self, layer_info):
         self.layer_info = layer_info
         function_name = _describe_layer_function(layer_info.get('function'))
+        material_name = _to_unicode(layer_info.get('material_name') or u'')
         width_mm = _feet_to_mm(layer_info.get('width', 0.0))
         try:
             width_text = u"{:.1f}".format(width_mm)
         except Exception:
             width_text = _to_unicode(width_mm)
-        self.name = u"Слой {index}: {function} ({width} мм)".format(
+        details = []
+        if material_name:
+            details.append(u"Материал: {}".format(material_name))
+        details.append(u"{} мм".format(width_text))
+        detail_text = u", ".join(details)
+        core_suffix = u" (ядро)" if layer_info.get('is_core') else u""
+        self.name = u"Слой {index}{core}: {function} — {details}".format(
             index=layer_info.get('index'),
+            core=core_suffix,
             function=function_name,
-            width=width_text,
+            details=detail_text,
         )
 
 
@@ -1164,6 +1172,29 @@ def _collect_structure(wall):
     return structure, layers
 
 
+def _get_material_name(material_id):
+    if material_id is None or not isinstance(material_id, ElementId):
+        return u''
+
+    try:
+        if material_id.IntegerValue < 1:
+            return u''
+    except Exception:
+        pass
+
+    try:
+        material = doc.GetElement(material_id)
+    except Exception:
+        material = None
+
+    name = _get_element_name(material)
+    if name:
+        return name
+
+    try:
+        return u'ID {}'.format(material_id.IntegerValue)
+    except Exception:
+        return u''
 
 
 
@@ -1341,6 +1372,8 @@ def _structure_layers_data(structure):
                 material_id = candidate
                 break
 
+        material_name = _get_material_name(material_id)
+
         if (
             (material_id is None)
             or (not isinstance(material_id, ElementId))
@@ -1357,6 +1390,7 @@ def _structure_layers_data(structure):
                 and candidate.IntegerValue > 0
             ):
                 material_id = candidate
+                material_name = _get_material_name(material_id)
 
         try:
             function = layer.Function
@@ -1377,6 +1411,7 @@ def _structure_layers_data(structure):
             'start': start,
             'end': end,
             'material_id': material_id,
+            'material_name': material_name,
             'function': function,
             'is_core': is_core,
             'is_first': idx == 0,
