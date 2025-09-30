@@ -23,6 +23,10 @@ from Autodesk.Revit.DB import (
     BuiltInParameter,
     CompoundStructure,
     CompoundStructureLayer,
+    FailureHandlingOptions,
+    FailureProcessingResult,
+    FailureSeverity,
+    IFailuresPreprocessor,
     ElementId,
     FamilyInstance,
     FilteredElementCollector,
@@ -47,6 +51,7 @@ from Autodesk.Revit.DB import (
     Options,
     Solid,
     ViewDetailLevel,
+    BuiltInFailures,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -125,6 +130,101 @@ def _describe_layer_function(layer_function):
         return _LAYER_FUNCTION_MAP[layer_function]
     except Exception:
         return _to_unicode(layer_function)
+
+
+class _SuppressOverlappingWallsPreprocessor(IFailuresPreprocessor):
+    """Автоматически скрывает предупреждения о перекрывающихся стенах."""
+
+    _KEYWORDS = (u"перекры", u"overlap")
+
+    def __init__(self):
+        overlap_ids = []
+        try:
+            wall_failures = getattr(BuiltInFailures, 'WallFailures', None)
+        except Exception:
+            wall_failures = None
+        candidate_names = (
+            'WallOverlap',
+            'WallOverlaps',
+            'WallFacesOverlap',
+        )
+        for name in candidate_names:
+            try:
+                failure_id = getattr(wall_failures, name)
+            except Exception:
+                failure_id = None
+            if failure_id:
+                overlap_ids.append(failure_id)
+        self._overlap_ids = tuple(overlap_ids)
+
+    def _is_overlap_failure(self, failure_message):
+        try:
+            failure_id = failure_message.GetFailureDefinitionId()
+        except Exception:
+            failure_id = None
+        for target in self._overlap_ids:
+            try:
+                if failure_id == target:
+                    return True
+            except Exception:
+                continue
+
+        try:
+            text = failure_message.GetDescriptionText()
+        except Exception:
+            text = u""
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(keyword in lowered for keyword in self._KEYWORDS)
+
+    def PreprocessFailures(self, failures_accessor):  # noqa: N802 (Revit API стиль)
+        if failures_accessor is None:
+            return FailureProcessingResult.Continue
+
+        try:
+            failure_messages = list(failures_accessor.GetFailureMessages())
+        except Exception:
+            failure_messages = []
+
+        for failure in failure_messages:
+            try:
+                severity = failure.GetSeverity()
+            except Exception:
+                severity = None
+
+            if severity != FailureSeverity.Warning:
+                continue
+
+            if not self._is_overlap_failure(failure):
+                continue
+
+            try:
+                failures_accessor.DeleteWarning(failure)
+            except Exception:
+                continue
+
+        return FailureProcessingResult.Continue
+
+
+_SUPPRESS_OVERLAP_FAILURES = _SuppressOverlappingWallsPreprocessor()
+
+
+def _configure_transaction_failures(transaction):
+    if transaction is None:
+        return
+
+    try:
+        options = transaction.GetFailureHandlingOptions()
+    except Exception:
+        return
+
+    try:
+        options.SetFailuresPreprocessor(_SUPPRESS_OVERLAP_FAILURES)
+        options.SetClearAfterRollback(True)
+        transaction.SetFailureHandlingOptions(options)
+    except Exception:
+        return
 
 
 def _get_param_double(element, param_id):
@@ -2739,6 +2839,7 @@ def _create_wall_layer(job, layer_info):
         layer_info.get('index'), job.get('wall_id')
     )
     t = Transaction(doc, transaction_name)
+    _configure_transaction_failures(t)
     t.Start()
     try:
         new_wall = Wall.Create(
@@ -2861,6 +2962,7 @@ def _finalize_wall_job(job, show_alert=None):
 
     transaction_name = 'Завершение разделения стены {}'.format(wall_id)
     t = Transaction(doc, transaction_name)
+    _configure_transaction_failures(t)
     t.Start()
     try:
         host_wall_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
