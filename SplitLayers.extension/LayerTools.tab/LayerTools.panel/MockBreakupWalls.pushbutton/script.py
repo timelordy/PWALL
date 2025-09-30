@@ -780,8 +780,7 @@ def _auto_join_with_nearby_layers(produced_layers, tolerance_distance=1.0):
                     matched_wall.Id.IntegerValue,
                     exc
                 )
-
-
+                
 def _determine_join_configuration(first_wall, second_wall, tolerance=0.1):
     if first_wall is None or second_wall is None:
         return None
