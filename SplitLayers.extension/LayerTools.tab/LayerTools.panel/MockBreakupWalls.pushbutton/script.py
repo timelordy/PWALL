@@ -1344,7 +1344,10 @@ class _LayerSelectionDialog(object):
         except Exception:
             key = None
         if key == Key.Enter:
-            self._accept()
+            if self._default_button is not None:
+                self._on_choose_first_layer(self._default_button, args)
+            else:
+                self._accept()
         elif key == Key.Escape:
             self._result = None
             self._window.Close()
@@ -1363,6 +1366,11 @@ class _LayerSelectionDialog(object):
                 self._result = None
         else:
             self._result = None
+        if args is not None:
+            try:
+                args.Handled = True
+            except Exception:
+                pass
         self._window.Close()
 
     def _accept(self):
