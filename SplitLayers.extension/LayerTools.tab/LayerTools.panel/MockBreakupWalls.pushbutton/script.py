@@ -856,6 +856,50 @@ def _normalize_join_info(join_info):
     }
 
 
+def _layer_has_join_target(layer_info, joined_infos):
+    if not layer_info or not joined_infos:
+        return False
+
+    try:
+        layer_index = layer_info.get('index')
+    except Exception:
+        layer_index = None
+
+    try:
+        signature = _layer_signature_for_join(layer_info)
+    except Exception:
+        signature = None
+
+    for raw_info in joined_infos:
+        info = _normalize_join_info(raw_info)
+        entry = info.get('entry') if isinstance(info, dict) else None
+        if not entry:
+            # Нет подробностей о слоях, но стена существует — считаем, что
+            # соединение нужно.
+            return True
+
+        layers = entry.get('layers') or []
+        if not layers:
+            return True
+
+        for neighbour_layer in layers:
+            if layer_index is not None and neighbour_layer.get('index') == layer_index:
+                return True
+
+            if signature is None:
+                continue
+
+            try:
+                neighbour_signature = _layer_signature_for_join(neighbour_layer)
+            except Exception:
+                neighbour_signature = None
+
+            if neighbour_signature == signature:
+                return True
+
+    return False
+
+
 def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_wall_ids):
     if not produced_layers:
         return
@@ -2479,6 +2523,11 @@ def _breakup_wall(wall, show_alert=True):
     base_curve = context['curve']
     base_level_id = context['base_level_id']
 
+    join_expectations = {}
+    for info in layer_data:
+        index = info.get('index')
+        join_expectations[index] = _layer_has_join_target(info, joined_wall_ids)
+
     created_walls = []
     produced_layers = []
     t = Transaction(doc, 'Разделение стены на слои')
@@ -2499,20 +2548,24 @@ def _breakup_wall(wall, show_alert=True):
             translation_vector = _scale_vector(inward, offset_center)
             layer_width = layer_info.get('width')
 
-            # Ранее первый и последний слои не укорачивались вовсе, поэтому в
-            # Г-образных соединениях они вытягивались до общей длины и
-            # пересекались с перпендикулярной стеной. Пользователь ожидает, что
-            # *каждый* слой будет недоведён до угла на толщину самого слоя,
-            # чтобы при стыковке двух одинаковых стен их одноимённые слои
-            # корректно расходились и не пересекались. Для однослойной стены
-            # оставляем исходное поведение (укорачивать нечего), а при количестве
-            # слоёв больше одного сокращаем стену на величину слоя независимо от
-            # его позиции.
+            expects_join = bool(join_expectations.get(layer_info.get('index')))
+            layer_info['expects_join'] = expects_join
 
-            if len(layer_data) > 1 and layer_width is not None:
+            # Новая схема укорачивания: внешний (первый) слой всегда сохраняет
+            # исходную длину исходной стены. Для остальных слоёв мы укорачиваем
+            # стену только тогда, когда рядом есть стена, с которой требуется
+            # выполнить соединение. Если стена "не видит" перед собой соседей,
+            # она также создаётся по исходной длине.
+
+            shrink_distance = 0.0
+            if (
+                len(layer_data) > 1
+                and layer_width is not None
+                and not layer_info.get('is_first')
+                and expects_join
+            ):
                 shrink_distance = layer_width
-            else:
-                shrink_distance = 0.0
+
             adjusted_curve = _shrink_curve(base_curve, shrink_distance) or base_curve
             placement_curve = adjusted_curve.CreateTransformed(
                 Transform.CreateTranslation(translation_vector)
