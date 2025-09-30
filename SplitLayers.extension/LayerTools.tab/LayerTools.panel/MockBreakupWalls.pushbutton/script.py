@@ -46,6 +46,7 @@ from Autodesk.Revit.DB import (
     Line,
     XYZ,
     JoinGeometryUtils,
+    ElementTransformUtils,
     InstanceVoidCutUtils,
     GeometryInstance,
     Options,
@@ -71,6 +72,10 @@ _LAYER_JOIN_CACHE = {}
 _PENDING_LAYER_JOINS = defaultdict(list)
 _OPENING_MARGIN = 0.0
 _OFFSET_TOLERANCE = 1e-4
+try:
+    _STAGING_DISTANCE = UnitUtils.ConvertToInternalUnits(12000.0, UnitTypeId.Millimeters)
+except Exception:
+    _STAGING_DISTANCE = 12000.0 / 304.8  # ~12 м в футах
 
 try:
     _REVIT_MIN_DIMENSION = UnitUtils.ConvertToInternalUnits(1.0 / 32.0, UnitTypeId.Feet)
@@ -1888,6 +1893,59 @@ def _scale_vector(vector, scale):
         return XYZ.Zero
 
 
+def _is_zero_vector(vector, tolerance=1e-9):
+    if vector is None:
+        return True
+    try:
+        if vector.IsZeroLength():
+            return True
+    except Exception:
+        pass
+    try:
+        x = float(getattr(vector, 'X', 0.0))
+        y = float(getattr(vector, 'Y', 0.0))
+        z = float(getattr(vector, 'Z', 0.0))
+    except Exception:
+        return False
+    return abs(x) <= tolerance and abs(y) <= tolerance and abs(z) <= tolerance
+
+
+def _add_vectors(*vectors):
+    total_x = total_y = total_z = 0.0
+    has_value = False
+    for vector in vectors:
+        if vector is None:
+            continue
+        added = False
+        try:
+            total_x += float(getattr(vector, 'X', 0.0))
+            total_y += float(getattr(vector, 'Y', 0.0))
+            total_z += float(getattr(vector, 'Z', 0.0))
+            added = True
+        except Exception:
+            try:
+                total_x += getattr(vector, 'X', 0.0)
+                total_y += getattr(vector, 'Y', 0.0)
+                total_z += getattr(vector, 'Z', 0.0)
+                added = True
+            except Exception:
+                added = False
+        if added:
+            has_value = True
+    if not has_value:
+        return XYZ.Zero
+    return XYZ(total_x, total_y, total_z)
+
+
+def _plan_staging_vector(inward_vector):
+    if _STAGING_DISTANCE <= _WIDTH_EPS:
+        return XYZ.Zero
+    candidate = _scale_vector(inward_vector, _STAGING_DISTANCE)
+    if _is_zero_vector(candidate):
+        return XYZ.Zero
+    return candidate
+
+
 def _shrink_curve(curve, shrink_distance, min_length=1e-6):
     """Возвращает копию кривой, укороченной на указанную величину."""
 
@@ -2920,6 +2978,12 @@ def _prepare_wall_job(wall, show_alert=True):
     except Exception:
         pass
 
+    staging_vector = XYZ.Zero
+    staging_applied = False
+    if len(layer_data) > 1:
+        staging_vector = _plan_staging_vector(inward)
+        staging_applied = not _is_zero_vector(staging_vector)
+
     join_expectations = {}
     for info in layer_data:
         index = info.get('index')
@@ -2940,6 +3004,8 @@ def _prepare_wall_job(wall, show_alert=True):
         'selected_layer_index': selected_layer_index,
         'context': context,
         'inward': inward,
+        'staging_vector': staging_vector,
+        'staging_applied': staging_applied,
         'join_expectations': join_expectations,
         'created_walls': [],
         'produced_layers': [],
@@ -2993,7 +3059,11 @@ def _create_wall_layer(job, layer_info):
     offset_center = layer_center - context['reference_offset']
     layer_info['offset'] = offset_center
     layer_info['reference_offset'] = context['reference_offset']
-    translation_vector = _scale_vector(job['inward'], offset_center)
+    translation_vector = _scale_vector(job.get('inward'), offset_center)
+    staging_vector = job.get('staging_vector') if job.get('staging_applied') else XYZ.Zero
+    total_translation = translation_vector
+    if not _is_zero_vector(staging_vector):
+        total_translation = _add_vectors(translation_vector, staging_vector)
     layer_width = layer_info.get('width')
 
     expects_join = bool(job['join_expectations'].get(layer_info.get('index')))
@@ -3011,7 +3081,7 @@ def _create_wall_layer(job, layer_info):
     base_curve = context['curve']
     adjusted_curve = _shrink_curve(base_curve, shrink_distance) or base_curve
     placement_curve = adjusted_curve.CreateTransformed(
-        Transform.CreateTranslation(translation_vector)
+        Transform.CreateTranslation(total_translation)
     )
 
     transaction_name = 'Создание слоя {} для стены {}'.format(
@@ -3049,6 +3119,7 @@ def _create_wall_layer(job, layer_info):
             'info': dict(layer_info),
             'offset': offset_center,
             'reference_offset': context['reference_offset'],
+            'staging_applied': job.get('staging_applied', False),
         })
         logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
 
@@ -3152,6 +3223,28 @@ def _finalize_wall_job(job, show_alert=None):
     _configure_transaction_failures(t)
     t.Start()
     try:
+        staging_vector = job.get('staging_vector') if job.get('staging_applied') else XYZ.Zero
+        if not _is_zero_vector(staging_vector):
+            move_vector = _negate_vector(staging_vector)
+            for record in valid_layers:
+                wall_part = record.get('wall')
+                if wall_part is None:
+                    continue
+                try:
+                    ElementTransformUtils.MoveElement(doc, wall_part.Id, move_vector)
+                except Exception as exc:
+                    layer_index = (record.get('info') or {}).get('index')
+                    logger.debug(
+                        'Не удалось временно переместить стену слоя %s обратно: %s',
+                        layer_index,
+                        exc,
+                    )
+            try:
+                doc.Regenerate()
+            except Exception:
+                pass
+            job['staging_applied'] = False
+
         host_wall_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
         for record in valid_layers:
             wall_part = record.get('wall')
