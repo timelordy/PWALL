@@ -39,6 +39,7 @@ from Autodesk.Revit.DB import (
     WallLocationLine,
     WallType,
     WallUtils,
+    Line,
     XYZ,
     JoinGeometryUtils,
     InstanceVoidCutUtils,
@@ -1491,6 +1492,67 @@ def _scale_vector(vector, scale):
         return XYZ.Zero
 
 
+def _shrink_curve(curve, shrink_distance, min_length=1e-6):
+    """Возвращает копию кривой, укороченной на указанную величину."""
+
+    if curve is None:
+        return None
+
+    try:
+        shrink = abs(float(shrink_distance or 0.0))
+    except Exception:
+        shrink = 0.0
+
+    if shrink <= min_length:
+        return curve
+
+    try:
+        length = float(curve.Length)
+    except Exception:
+        try:
+            length = float(curve.ApproximateLength)
+        except Exception:
+            length = None
+
+    if length is None or length <= min_length:
+        return curve
+
+    max_shrink = max(0.0, length - min_length)
+    if max_shrink <= min_length:
+        return curve
+
+    shrink = min(shrink, max_shrink)
+    half_shrink = shrink / 2.0
+
+    try:
+        start_param = curve.GetEndParameter(0)
+        end_param = curve.GetEndParameter(1)
+        param_range = end_param - start_param
+        if param_range > 0:
+            param_delta = (half_shrink / length) * param_range
+            new_start = start_param + param_delta
+            new_end = end_param - param_delta
+            if new_end > new_start:
+                trimmed = curve.CreateTrimmedCurve(new_start, new_end)
+                if trimmed:
+                    return trimmed
+    except Exception:
+        pass
+
+    try:
+        start = curve.GetEndPoint(0)
+        end = curve.GetEndPoint(1)
+        direction = end - start
+        if direction.IsZeroLength():
+            return curve
+        direction = direction.Normalize()
+        new_start = start + direction.Multiply(half_shrink)
+        new_end = end - direction.Multiply(half_shrink)
+        return Line.CreateBound(new_start, new_end)
+    except Exception:
+        return curve
+
+
 def _make_signature(layer_info):
     material_id = layer_info['material_id']
     material_value = material_id.IntegerValue if material_id and material_id.IntegerValue > 0 else -1
@@ -2289,7 +2351,10 @@ def _breakup_wall(wall, show_alert=True):
             layer_info['offset'] = offset_center
             layer_info['reference_offset'] = context['reference_offset']
             translation_vector = _scale_vector(inward, offset_center)
-            placement_curve = base_curve.CreateTransformed(Transform.CreateTranslation(translation_vector))
+            adjusted_curve = _shrink_curve(base_curve, layer_info.get('width')) or base_curve
+            placement_curve = adjusted_curve.CreateTransformed(
+                Transform.CreateTranslation(translation_vector)
+            )
 
             try:
                 new_wall = Wall.Create(
