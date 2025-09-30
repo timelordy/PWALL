@@ -601,6 +601,41 @@ def _suppress_auto_join(wall):
     return success
 
 
+def _set_room_bounding(wall, enabled):
+    if wall is None:
+        return False
+
+    value = 1 if enabled else 0
+    result = False
+    param_names = (
+        'WALL_ATTR_ROOM_BOUNDING',
+        'ROOM_BOUNDING',
+    )
+
+    for param_name in param_names:
+        param_id = getattr(BuiltInParameter, param_name, None)
+        if param_id is None:
+            continue
+        try:
+            param = wall.get_Parameter(param_id)
+        except Exception:
+            param = None
+        if param is None:
+            continue
+        try:
+            if getattr(param, 'IsReadOnly', False):
+                continue
+        except Exception:
+            pass
+        try:
+            param.Set(value)
+            result = True
+        except Exception:
+            continue
+
+    return result
+
+
 def _unjoin_two_walls(first_wall, second_wall):
     if first_wall is None or second_wall is None:
         return False
@@ -2726,6 +2761,15 @@ def _finalize_wall_job(job, show_alert=None):
     t = Transaction(doc, transaction_name)
     t.Start()
     try:
+        host_wall_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
+        for record in produced_layers:
+            wall_part = record.get('wall')
+            if wall_part is None:
+                continue
+            wall_part_id = getattr(getattr(wall_part, 'Id', None), 'IntegerValue', None)
+            should_bound = host_wall_id is not None and wall_part_id == host_wall_id
+            _set_room_bounding(wall_part, should_bound)
+
         _rehost_instances(job.get('hosted_instances'), host_wall, preceding_walls)
 
         for i in range(len(created_walls)):
