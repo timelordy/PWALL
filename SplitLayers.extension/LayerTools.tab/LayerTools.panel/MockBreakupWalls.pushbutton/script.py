@@ -1278,13 +1278,21 @@ _LAYER_SELECTION_XAML = u"""
         Topmost="True"
         AllowsTransparency="False">
     <DockPanel Margin="12">
-        <Button x:Name="OkButton"
-                Content="Выбрать"
-                DockPanel.Dock="Bottom"
-                Width="110"
-                Height="28"
-                HorizontalAlignment="Right"
-                Margin="0,12,0,0"/>
+        <StackPanel Orientation="Horizontal"
+                    DockPanel.Dock="Bottom"
+                    HorizontalAlignment="Right"
+                    Margin="0,12,0,0">
+            <Button x:Name="DefaultLayerButton"
+                    Content="К первому слою"
+                    Width="140"
+                    Height="28"
+                    Margin="0,0,8,0"
+                    IsDefault="True"/>
+            <Button x:Name="OkButton"
+                    Content="Выбрать"
+                    Width="110"
+                    Height="28"/>
+        </StackPanel>
         <ListBox x:Name="LayerList"
                  DisplayMemberPath="name"
                  HorizontalContentAlignment="Stretch"
@@ -1302,12 +1310,15 @@ class _LayerSelectionDialog(object):
         self._window.WindowStartupLocation = WindowStartupLocation.Manual
         self._listbox = self._window.FindName('LayerList')
         self._ok_button = self._window.FindName('OkButton')
+        self._default_button = self._window.FindName('DefaultLayerButton')
         self._listbox.ItemsSource = self._choices
         if default_choice in self._choices:
             self._listbox.SelectedItem = default_choice
         elif self._choices:
             self._listbox.SelectedIndex = 0
         self._ok_button.Click += self._on_accept
+        if self._default_button is not None:
+            self._default_button.Click += self._on_choose_first_layer
         self._window.KeyDown += self._on_key_down
         self._listbox.MouseDoubleClick += self._on_double_click
         self._result = None
@@ -1328,7 +1339,10 @@ class _LayerSelectionDialog(object):
         except Exception:
             key = None
         if key == Key.Enter:
-            self._accept()
+            if self._default_button is not None:
+                self._on_choose_first_layer(self._default_button, args)
+            else:
+                self._accept()
         elif key == Key.Escape:
             self._result = None
             self._window.Close()
@@ -1338,6 +1352,21 @@ class _LayerSelectionDialog(object):
 
     def _on_accept(self, sender, args):
         self._accept()
+
+    def _on_choose_first_layer(self, sender, args):
+        if self._choices:
+            try:
+                self._result = self._choices[0]
+            except Exception:
+                self._result = None
+        else:
+            self._result = None
+        if args is not None:
+            try:
+                args.Handled = True
+            except Exception:
+                pass
+        self._window.Close()
 
     def _accept(self):
         try:
