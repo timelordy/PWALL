@@ -4,10 +4,53 @@
 __title__ = 'Разбить\nСтену'
 __author__ = 'Wall Layers Separator'
 
-import clr
+try:
+    import clr  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - среда без pythonnet
+    class _ClrStub(object):
+        """Простейшая заглушка для pythonnet, чтобы код не падал при импорте."""
 
-from System import Enum, MissingMemberException
-from System.Collections.Generic import List
+        @staticmethod
+        def AddReference(*_args, **_kwargs):
+            """Ничего не делает, но повторяет интерфейс настоящего clr."""
+
+    clr = _ClrStub()  # type: ignore[assignment]
+
+try:  # pragma: no cover - реальные типы доступны только в Revit
+    from System import Enum, MissingMemberException
+    from System.Collections.Generic import List
+except ImportError:  # pragma: no cover - среда без pythonnet
+    class MissingMemberException(AttributeError):
+        """Заглушка исключения, чтобы не зависеть от .NET."""
+
+    class _EnumHelper(object):
+        """Минимальная реализация методов Enum, используемых в скрипте."""
+
+        @staticmethod
+        def GetNames(enum_type):
+            return [name for name in dir(enum_type) if not name.startswith('_')]
+
+        @staticmethod
+        def Parse(enum_type, name):
+            return getattr(enum_type, name)
+
+    class Enum(_EnumHelper):  # type: ignore[call-arg]
+        pass
+
+    class _GenericList(list):
+        """Список с методом Add, имитирующий .NET List."""
+
+        def Add(self, item):
+            self.append(item)
+
+    class _ListFactory(object):
+        def __getitem__(self, _item):
+            return _GenericList
+
+        def __call__(self, *_args, **_kwargs):
+            return _GenericList()
+
+    List = _ListFactory()  # type: ignore[assignment]
 
 try:
     unicode  # type: ignore[name-defined]
@@ -15,21 +58,84 @@ except NameError:  # pragma: no cover - безопасность для Python 3
     unicode = str
 
 # Импорт Revit API
-clr.AddReference('RevitAPI')
-clr.AddReference('RevitAPIUI')
-from Autodesk.Revit.DB import (
-    BuiltInParameter,
-    ElementId,
-    MaterialFunctionAssignment,
-    PartUtils,
-    PartsVisibility,
-    UnitTypeId,
-    UnitUtils,
-    Wall,
-    WallType,
-    WallUtils,
-)
-from Autodesk.Revit.UI.Selection import ObjectType
+try:  # pragma: no cover - реальные сборки доступны только в Revit
+    clr.AddReference('RevitAPI')
+    clr.AddReference('RevitAPIUI')
+except Exception:  # pragma: no cover - в среде тестов просто игнорируем
+    pass
+
+try:  # pragma: no cover - реальные типы доступны только в Revit
+    from Autodesk.Revit.DB import (
+        BuiltInParameter,
+        ElementId,
+        MaterialFunctionAssignment,
+        PartUtils,
+        PartsVisibility,
+        UnitTypeId,
+        UnitUtils,
+        Wall,
+        WallType,
+        WallUtils,
+    )
+    from Autodesk.Revit.UI.Selection import ObjectType
+except ImportError:  # pragma: no cover - заглушки для среды без Revit
+    class _RevitObject(object):
+        """Базовый класс-заглушка, чтобы isinstance продолжал работать."""
+
+    class BuiltInParameter(_RevitObject):
+        pass
+
+    class ElementId(_RevitObject):
+        def __init__(self, value=0):
+            self.IntegerValue = int(value)
+
+        def __int__(self):
+            return self.IntegerValue
+
+    class MaterialFunctionAssignment(_RevitObject):
+        Structure = 'Structure'
+        Substrate = 'Substrate'
+        Insulation = 'Insulation'
+        Finish1 = 'Finish1'
+        Finish2 = 'Finish2'
+        Membrane = 'Membrane'
+        Other = 'Other'
+
+    class PartsVisibility(_RevitObject):
+        ShowParts = 'ShowParts'
+        ShowPartsOnly = 'ShowPartsOnly'
+        ShowPartsAndOriginal = 'ShowPartsAndOriginal'
+        ShowOriginalAndParts = 'ShowOriginalAndParts'
+        PartsAndOriginal = 'PartsAndOriginal'
+
+    class UnitTypeId(_RevitObject):
+        Millimeters = 'Millimeters'
+
+    class UnitUtils(_RevitObject):
+        @staticmethod
+        def ConvertFromInternalUnits(value, _unit):
+            return value * 304.8
+
+    class PartUtils(_RevitObject):
+        @staticmethod
+        def IsElementValidForCreateParts(_doc, _element_id):
+            return False
+
+        @staticmethod
+        def CreateParts(_doc, _element_ids):
+            raise RuntimeError('PartUtils недоступен вне Revit')
+
+    class Wall(_RevitObject):
+        pass
+
+    class WallType(_RevitObject):
+        pass
+
+    class WallUtils(_RevitObject):
+        pass
+
+    class ObjectType(_RevitObject):
+        Element = 'Element'
 
 try:
     from Autodesk.Revit.Exceptions import ArgumentException as RevitArgumentException
@@ -38,8 +144,57 @@ except ImportError:
 
 # Импорт PyRevit
 def _load_pyrevit_modules():
-    from pyrevit import revit, forms, script
-    return revit, forms, script
+    try:  # pragma: no cover - настоящие модули доступны только в Revit
+        from pyrevit import revit, forms, script  # type: ignore[import-not-found]
+        return revit, forms, script
+    except ImportError:  # pragma: no cover - заглушки для среды без pyRevit
+        class _DummyTransaction(object):
+            def __init__(self, _name):
+                self.name = _name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        class _DummySelection(object):
+            def PickObject(self, *_args, **_kwargs):
+                raise RuntimeError('Выбор элементов недоступен вне Revit')
+
+        class _DummyUIDoc(object):
+            ActiveView = None
+            Selection = _DummySelection()
+
+        class _DummyRevit(object):
+            is_dummy = True
+            doc = None
+            uidoc = _DummyUIDoc()
+
+            @staticmethod
+            def Transaction(name):  # type: ignore[override]
+                return _DummyTransaction(name)
+
+        class _DummyForms(object):
+            is_dummy = True
+            @staticmethod
+            def alert(message, **_kwargs):
+                raise RuntimeError(u"pyRevit недоступен: {}".format(message))
+
+        class _DummyOutput(object):
+            def print_md(self, message):
+                print(message)
+
+            def linkify(self, value):
+                return value
+
+        class _DummyScript(object):
+            is_dummy = True
+            @staticmethod
+            def get_output():
+                return _DummyOutput()
+
+        return _DummyRevit(), _DummyForms(), _DummyScript()
 
 revit, forms, script = _load_pyrevit_modules()
 
@@ -1233,5 +1388,8 @@ class CompositeWallPartsPipeline(object):
 
 
 if __name__ == '__main__':
-    pipeline = CompositeWallPartsPipeline()
-    pipeline.execute()
+    if getattr(revit, 'is_dummy', False):
+        print(u"Скрипт предназначен для запуска внутри Revit через pyRevit.")
+    else:
+        pipeline = CompositeWallPartsPipeline()
+        pipeline.execute()
