@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 # -*- coding: utf-8 -*-
+
+from __future__ import annotations
 """Разбивает составную стену на отдельные стены-слои, автоматически создавая тип для каждого слоя."""
 
 import sys
