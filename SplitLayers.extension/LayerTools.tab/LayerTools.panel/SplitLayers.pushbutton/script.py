@@ -4,26 +4,10 @@
 __title__ = 'Разбить\nСтену'
 __author__ = 'Wall Layers Separator'
 
-import sys
-from typing import TYPE_CHECKING
+import clr
 
-try:
-    import clr  # type: ignore
-except ImportError:  # pragma: no cover - модуль доступен только внутри Revit
-    clr = None
-
-try:  # pragma: no cover - доступно только в окружении Revit
-    if clr is not None:
-        clr.AddReference('System')
-    from System import Enum, MissingMemberException  # type: ignore
-    from System.Collections.Generic import List  # type: ignore
-except Exception:  # pragma: no cover - запасной путь для оффлайн-запуска
-    Enum = None  # type: ignore[assignment]
-
-    class MissingMemberException(Exception):
-        """Заглушка, используемая при запуске вне Revit."""
-
-    List = None  # type: ignore[assignment]
+from System import Enum, MissingMemberException
+from System.Collections.Generic import List
 
 try:
     unicode  # type: ignore[name-defined]
@@ -31,55 +15,21 @@ except NameError:  # pragma: no cover - безопасность для Python 3
     unicode = str
 
 # Импорт Revit API
-REVIT_IMPORT_ERROR = None
-
-if clr is not None:  # pragma: no cover - зависит от окружения pyRevit
-    try:
-        clr.AddReference('RevitAPI')
-        clr.AddReference('RevitAPIUI')
-    except Exception as import_error:  # pragma: no cover
-        REVIT_IMPORT_ERROR = import_error
-
-if REVIT_IMPORT_ERROR is None:
-    try:  # pragma: no cover - выполняется только внутри Revit
-        from Autodesk.Revit.DB import (  # type: ignore
-            BuiltInParameter,
-            ElementId,
-            MaterialFunctionAssignment,
-            PartUtils,
-            PartsVisibility,
-            UnitTypeId,
-            UnitUtils,
-            Wall,
-            WallType,
-            WallUtils,
-        )
-        from Autodesk.Revit.UI.Selection import ObjectType  # type: ignore
-    except Exception as import_error:  # pragma: no cover
-        REVIT_IMPORT_ERROR = import_error
-        BuiltInParameter = None  # type: ignore[assignment]
-        ElementId = None  # type: ignore[assignment]
-        MaterialFunctionAssignment = None  # type: ignore[assignment]
-        PartUtils = None  # type: ignore[assignment]
-        PartsVisibility = None  # type: ignore[assignment]
-        UnitTypeId = None  # type: ignore[assignment]
-        UnitUtils = None  # type: ignore[assignment]
-        Wall = None  # type: ignore[assignment]
-        WallType = None  # type: ignore[assignment]
-        WallUtils = None  # type: ignore[assignment]
-        ObjectType = None  # type: ignore[assignment]
-else:
-    BuiltInParameter = None  # type: ignore[assignment]
-    ElementId = None  # type: ignore[assignment]
-    MaterialFunctionAssignment = None  # type: ignore[assignment]
-    PartUtils = None  # type: ignore[assignment]
-    PartsVisibility = None  # type: ignore[assignment]
-    UnitTypeId = None  # type: ignore[assignment]
-    UnitUtils = None  # type: ignore[assignment]
-    Wall = None  # type: ignore[assignment]
-    WallType = None  # type: ignore[assignment]
-    WallUtils = None  # type: ignore[assignment]
-    ObjectType = None  # type: ignore[assignment]
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+from Autodesk.Revit.DB import (
+    BuiltInParameter,
+    ElementId,
+    MaterialFunctionAssignment,
+    PartUtils,
+    PartsVisibility,
+    UnitTypeId,
+    UnitUtils,
+    Wall,
+    WallType,
+    WallUtils,
+)
+from Autodesk.Revit.UI.Selection import ObjectType
 
 try:
     from Autodesk.Revit.Exceptions import ArgumentException as RevitArgumentException
@@ -87,68 +37,15 @@ except ImportError:
     RevitArgumentException = Exception
 
 # Импорт PyRevit
-def _load_pyrevit_modules():  # pragma: no cover - вызывается только в pyRevit
-    from pyrevit import revit, forms, script  # type: ignore
+def _load_pyrevit_modules():
+    from pyrevit import revit, forms, script
     return revit, forms, script
 
+revit, forms, script = _load_pyrevit_modules()
 
-try:  # pragma: no cover - зависит от окружения Revit
-    revit, forms, script = _load_pyrevit_modules()
-except Exception as import_error:  # pragma: no cover
-    revit = None
-    forms = None
-    script = None
-    if REVIT_IMPORT_ERROR is None:
-        REVIT_IMPORT_ERROR = import_error
-
-doc = getattr(revit, 'doc', None)
-uidoc = getattr(revit, 'uidoc', None)
-
-if script is not None:  # pragma: no cover - внутри pyRevit
-    output = script.get_output()
-else:
-    class _FallbackOutput(object):
-        """Простая заглушка для вывода текста вне Revit."""
-
-        @staticmethod
-        def print_md(message):
-            sys.stdout.write(u"{}\n".format(message))
-
-    output = _FallbackOutput()
-
-
-def _is_revit_environment_ready():
-    """Проверяет, доступны ли все зависимости Revit/pyRevit."""
-
-    if REVIT_IMPORT_ERROR is not None:
-        return False
-
-    required_objects = (revit, forms, script, doc, uidoc, BuiltInParameter, ElementId, PartUtils)
-    return all(required_objects)
-
-
-REVIT_ENV_READY = _is_revit_environment_ready()
-
-
-def _handle_missing_environment():
-    """Сообщает пользователю, что скрипт должен выполняться внутри pyRevit."""
-
-    message = (
-        u"Скрипт доступен только внутри pyRevit/Revit. "
-        u"Не удалось загрузить API: {}".format(REVIT_IMPORT_ERROR)
-        if REVIT_IMPORT_ERROR
-        else u"Скрипт доступен только внутри pyRevit/Revit."
-    )
-
-    if forms is not None:
-        try:
-            forms.alert(message, exitscript=True)
-            return
-        except Exception:
-            pass
-
-    output.print_md(message)
-    raise EnvironmentError(message)
+doc = revit.doc
+uidoc = revit.uidoc
+output = script.get_output()
 
 
 def convert_to_mm(value):
@@ -156,13 +53,9 @@ def convert_to_mm(value):
     if value is None:
         return 0.0
 
-    if UnitUtils is not None and UnitTypeId is not None:
-        try:
-            return round(UnitUtils.ConvertFromInternalUnits(value, UnitTypeId.Millimeters), 1)
-        except Exception:
-            pass
-
     try:
+        return round(UnitUtils.ConvertFromInternalUnits(value, UnitTypeId.Millimeters), 1)
+    except Exception:
         try:
             return round(value * 304.8, 1)
         except Exception:
@@ -170,10 +63,6 @@ def convert_to_mm(value):
 
 
 _NAME_PARAMETER_CANDIDATES = []
-
-_INVALID_ELEMENT_ID = (
-    getattr(ElementId, 'InvalidElementId', object()) if ElementId is not None else object()
-)
 
 
 def _append_name_parameter(param_name):
@@ -294,23 +183,19 @@ def get_element_name(element, default=u"Без имени"):
         return default
 
 
-if MaterialFunctionAssignment is not None:
-    _DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
+_DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
 
-    _LAYER_FUNCTION_MAP = {
-        MaterialFunctionAssignment.Structure: u"Несущий слой",
-        MaterialFunctionAssignment.Substrate: u"Основание",
-        MaterialFunctionAssignment.Insulation: u"Утеплитель",
-        MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
-        MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
-        MaterialFunctionAssignment.Membrane: u"Мембрана",
-    }
+_LAYER_FUNCTION_MAP = {
+    MaterialFunctionAssignment.Structure: u"Несущий слой",
+    MaterialFunctionAssignment.Substrate: u"Основание",
+    MaterialFunctionAssignment.Insulation: u"Утеплитель",
+    MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
+    MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
+    MaterialFunctionAssignment.Membrane: u"Мембрана",
+}
 
-    if _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
-        _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
-else:
-    _DEFAULT_LAYER_FUNCTION = None
-    _LAYER_FUNCTION_MAP = {}
+if _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
+    _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
 
 
 def describe_layer_function(layer_function):
@@ -815,19 +700,16 @@ def _set_part_name(part, value):
 def _set_part_material(part, material_id):
     """Присваивает материал части по ElementId слоя."""
 
-    if not part or material_id in (None, '', _INVALID_ELEMENT_ID):
+    if not part or material_id in (None, '', ElementId.InvalidElementId):
         return False
 
-    if ElementId is not None and isinstance(material_id, ElementId):
+    if isinstance(material_id, ElementId):
         target_id = material_id
     else:
         try:
-            target_id = ElementId(int(material_id)) if ElementId is not None else None
+            target_id = ElementId(int(material_id))
         except Exception:
             return False
-
-    if target_id is None:
-        return False
 
     param = None
     try:
@@ -853,9 +735,6 @@ class CompositeWallPartsPipeline(object):
     """Реализует пайплайн: подготовка вида → создание Parts → отчёт."""
 
     def __init__(self):
-        if not REVIT_ENV_READY:
-            _handle_missing_environment()
-
         self.doc = doc
         self.uidoc = uidoc
         self.view = uidoc.ActiveView
@@ -1354,8 +1233,5 @@ class CompositeWallPartsPipeline(object):
 
 
 if __name__ == '__main__':
-    if not REVIT_ENV_READY:
-        _handle_missing_environment()
-    else:
-        pipeline = CompositeWallPartsPipeline()
-        pipeline.execute()
+    pipeline = CompositeWallPartsPipeline()
+    pipeline.execute()

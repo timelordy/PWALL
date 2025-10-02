@@ -10,9 +10,11 @@
 в формате, удобном для последующей выгрузки в шаблон раздела 3.
 """
 
+from __future__ import annotations
+
 import math
 import re
-from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
 
 # Порядок полей соответствует структуре раздела 3.
 SECTION3_FIELDS: Sequence[str] = (
@@ -190,7 +192,7 @@ def _normalize_header(value: object) -> str:
     return text.strip()
 
 
-def _match_field(normalized_header: str) -> Optional[Tuple[str, int]]:
+def _match_field(normalized_header: str) -> Optional[tuple[str, int]]:
     """Определяет, к какому полю относится заголовок."""
 
     if not normalized_header:
@@ -200,7 +202,7 @@ def _match_field(normalized_header: str) -> Optional[Tuple[str, int]]:
     if lookup:
         return lookup, 0
 
-    checks: List[Tuple[str, int]] = []
+    checks: List[tuple[str, int]] = []
 
     if "условн" in normalized_header and "номер" in normalized_header:
         checks.append(("unit_number", 1))

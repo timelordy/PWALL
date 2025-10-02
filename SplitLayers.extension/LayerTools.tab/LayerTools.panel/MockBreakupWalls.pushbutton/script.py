@@ -1,198 +1,63 @@
 # -*- coding: utf-8 -*-
-
 """Разбивает составную стену на отдельные стены-слои, автоматически создавая тип для каждого слоя."""
 
-import sys
+import clr
+
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+clr.AddReference('System')
+clr.AddReference('System.Xml')
+clr.AddReference('PresentationCore')
+clr.AddReference('PresentationFramework')
+clr.AddReference('WindowsBase')
+
+from System.Collections.Generic import List
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from System.IO import StringReader
+from System.Xml import XmlReader
+from System.Windows import SystemParameters, WindowStartupLocation
+from System.Windows.Input import Key
+from System.Windows.Markup import XamlReader
 
-try:
-    import clr  # type: ignore
-except ImportError:  # pragma: no cover - модуль доступен только внутри Revit
-    clr = None
+from Autodesk.Revit.DB import (
+    BuiltInParameter,
+    CompoundStructure,
+    CompoundStructureLayer,
+    ElementId,
+    FamilyInstance,
+    FilteredElementCollector,
+    ElementClassFilter,
+    LocationCurve,
+    LocationPoint,
+    Opening,
+    MaterialFunctionAssignment,
+    Transform,
+    Transaction,
+    UnitTypeId,
+    UnitUtils,
+    Wall,
+    WallLocationLine,
+    WallType,
+    WallUtils,
+    XYZ,
+    JoinGeometryUtils,
+    InstanceVoidCutUtils,
+    GeometryInstance,
+    Options,
+    Solid,
+    ViewDetailLevel,
+)
+from Autodesk.Revit.DB.Structure import StructuralType
+from Autodesk.Revit.UI.Selection import ObjectType
 
-if clr is not None:  # pragma: no cover - доступно только в окружении Revit
-    for assembly_name in (
-        'RevitAPI',
-        'RevitAPIUI',
-        'System',
-        'System.Xml',
-        'PresentationCore',
-        'PresentationFramework',
-        'WindowsBase',
-    ):
-        try:
-            clr.AddReference(assembly_name)
-        except Exception:
-            pass
-
-try:  # pragma: no cover - доступно только внутри Revit
-    from System.Collections.Generic import List  # type: ignore
-    from System.IO import StringReader  # type: ignore
-    from System.Xml import XmlReader  # type: ignore
-    from System.Windows import SystemParameters, WindowStartupLocation  # type: ignore
-    from System.Windows.Input import Key  # type: ignore
-    from System.Windows.Markup import XamlReader  # type: ignore
-except Exception:  # pragma: no cover - запасной путь для оффлайн-запуска
-    List = None  # type: ignore[assignment]
-    StringReader = None  # type: ignore[assignment]
-    XmlReader = None  # type: ignore[assignment]
-    SystemParameters = None  # type: ignore[assignment]
-    WindowStartupLocation = None  # type: ignore[assignment]
-    Key = None  # type: ignore[assignment]
-    XamlReader = None  # type: ignore[assignment]
-
-REVIT_IMPORT_ERROR = None
-
-if clr is not None and REVIT_IMPORT_ERROR is None:  # pragma: no cover - pyRevit окружение
-    try:
-        from Autodesk.Revit.DB import (  # type: ignore
-            BuiltInParameter,
-            CompoundStructure,
-            CompoundStructureLayer,
-            ElementId,
-            FamilyInstance,
-            FilteredElementCollector,
-            ElementClassFilter,
-            LocationCurve,
-            LocationPoint,
-            Opening,
-            MaterialFunctionAssignment,
-            Transform,
-            Transaction,
-            UnitTypeId,
-            UnitUtils,
-            Wall,
-            WallLocationLine,
-            WallType,
-            WallUtils,
-            XYZ,
-            JoinGeometryUtils,
-            InstanceVoidCutUtils,
-            GeometryInstance,
-            Options,
-            Solid,
-            ViewDetailLevel,
-        )
-        from Autodesk.Revit.DB.Structure import StructuralType  # type: ignore
-        from Autodesk.Revit.UI.Selection import ObjectType  # type: ignore
-    except Exception as import_error:  # pragma: no cover
-        REVIT_IMPORT_ERROR = import_error
-
-if REVIT_IMPORT_ERROR is not None:
-    BuiltInParameter = None  # type: ignore[assignment]
-    CompoundStructure = None  # type: ignore[assignment]
-    CompoundStructureLayer = None  # type: ignore[assignment]
-    ElementId = None  # type: ignore[assignment]
-    FamilyInstance = None  # type: ignore[assignment]
-    FilteredElementCollector = None  # type: ignore[assignment]
-    ElementClassFilter = None  # type: ignore[assignment]
-    LocationCurve = None  # type: ignore[assignment]
-    LocationPoint = None  # type: ignore[assignment]
-    Opening = None  # type: ignore[assignment]
-    MaterialFunctionAssignment = None  # type: ignore[assignment]
-    Transform = None  # type: ignore[assignment]
-    Transaction = None  # type: ignore[assignment]
-    UnitTypeId = None  # type: ignore[assignment]
-    UnitUtils = None  # type: ignore[assignment]
-    Wall = None  # type: ignore[assignment]
-    WallLocationLine = None  # type: ignore[assignment]
-    WallType = None  # type: ignore[assignment]
-    WallUtils = None  # type: ignore[assignment]
-    XYZ = None  # type: ignore[assignment]
-    JoinGeometryUtils = None  # type: ignore[assignment]
-    InstanceVoidCutUtils = None  # type: ignore[assignment]
-    GeometryInstance = None  # type: ignore[assignment]
-    Options = None  # type: ignore[assignment]
-    Solid = None  # type: ignore[assignment]
-    ViewDetailLevel = None  # type: ignore[assignment]
-    StructuralType = None  # type: ignore[assignment]
-    ObjectType = None  # type: ignore[assignment]
-
-def _load_pyrevit_modules():  # pragma: no cover - вызывается внутри pyRevit
-    from pyrevit import revit, forms, script  # type: ignore
-    return revit, forms, script
-
-
-try:  # pragma: no cover - зависит от окружения pyRevit
-    revit, forms, script = _load_pyrevit_modules()
-except Exception as import_error:  # pragma: no cover
-    revit = None
-    forms = None
-    script = None
-    if REVIT_IMPORT_ERROR is None:
-        REVIT_IMPORT_ERROR = import_error
+from pyrevit import revit, forms, script
 
 import re
 
 
-doc = getattr(revit, 'doc', None)
-uidoc = getattr(revit, 'uidoc', None)
-
-if script is not None:  # pragma: no cover - pyRevit окружение
-    logger = script.get_logger()
-else:
-    class _FallbackLogger(object):
-        """Минимальный логгер для запуска вне Revit."""
-
-        @staticmethod
-        def info(message):
-            sys.stdout.write(u"{}\n".format(message))
-
-        debug = info
-        warning = info
-        error = info
-        exception = error
-
-    logger = _FallbackLogger()
-
-
-def _is_revit_environment_ready():
-    """Проверяет доступность всех обязательных зависимостей."""
-
-    if REVIT_IMPORT_ERROR is not None:
-        return False
-
-    required = (
-        revit,
-        forms,
-        script,
-        doc,
-        uidoc,
-        BuiltInParameter,
-        ElementId,
-        Wall,
-        WallType,
-        UnitUtils,
-        MaterialFunctionAssignment,
-        List,
-        Transaction,
-        FilteredElementCollector,
-    )
-
-    return all(required)
-
-
-REVIT_ENV_READY = _is_revit_environment_ready()
-
-
-def _handle_missing_environment():
-    message = (
-        u"Скрипт доступен только внутри pyRevit/Revit. "
-        u"Не удалось загрузить API: {}".format(REVIT_IMPORT_ERROR)
-        if REVIT_IMPORT_ERROR
-        else u"Скрипт доступен только внутри pyRevit/Revit."
-    )
-
-    if forms is not None:
-        try:
-            forms.alert(message, exitscript=True)
-            return
-        except Exception:
-            pass
-
-    logger.error(message)
-    raise EnvironmentError(message)
+doc = revit.doc
+uidoc = revit.uidoc
+logger = script.get_logger()
 
 _WIDTH_EPS = 1e-6
 _SIGNATURE_CACHE = {}
@@ -200,23 +65,11 @@ _LAYER_JOIN_CACHE = {}
 _PENDING_LAYER_JOINS = defaultdict(list)
 _OPENING_MARGIN = 0.0
 
-_CAN_ADD_VOID_CUT = (
-    getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
-    if InstanceVoidCutUtils is not None
-    else None
-)
-_ADD_INSTANCE_VOID_CUT = (
-    getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
-    if InstanceVoidCutUtils is not None
-    else None
-)
-_APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None) if WallUtils is not None else None
-_ALLOW_WALL_JOIN_AT_END = (
-    getattr(WallUtils, 'AllowWallJoinAtEnd', None) if WallUtils is not None else None
-)
-_DISALLOW_WALL_JOIN_AT_END = (
-    getattr(WallUtils, 'DisallowWallJoinAtEnd', None) if WallUtils is not None else None
-)
+_CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
+_ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
+_APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
+_ALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'AllowWallJoinAtEnd', None)
+_DISALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'DisallowWallJoinAtEnd', None)
 
 try:
     from Autodesk.Revit.DB import WallJoinType  # type: ignore
@@ -246,22 +99,18 @@ def _to_unicode(value):
             return u''
 
 
-if MaterialFunctionAssignment is not None:
-    _LAYER_FUNCTION_MAP = {
-        MaterialFunctionAssignment.Structure: u"Несущий слой",
-        MaterialFunctionAssignment.Substrate: u"Основание",
-        MaterialFunctionAssignment.Insulation: u"Утеплитель",
-        MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
-        MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
-        MaterialFunctionAssignment.Membrane: u"Мембрана",
-    }
+_LAYER_FUNCTION_MAP = {
+    MaterialFunctionAssignment.Structure: u"Несущий слой",
+    MaterialFunctionAssignment.Substrate: u"Основание",
+    MaterialFunctionAssignment.Insulation: u"Утеплитель",
+    MaterialFunctionAssignment.Finish1: u"Отделка (наружная)",
+    MaterialFunctionAssignment.Finish2: u"Отделка (внутренняя)",
+    MaterialFunctionAssignment.Membrane: u"Мембрана",
+}
 
-    _DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
-    if _DEFAULT_LAYER_FUNCTION is not None and _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
-        _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
-else:
-    _LAYER_FUNCTION_MAP = {}
-    _DEFAULT_LAYER_FUNCTION = None
+_DEFAULT_LAYER_FUNCTION = getattr(MaterialFunctionAssignment, 'Other', None)
+if _DEFAULT_LAYER_FUNCTION is not None and _DEFAULT_LAYER_FUNCTION not in _LAYER_FUNCTION_MAP:
+    _LAYER_FUNCTION_MAP[_DEFAULT_LAYER_FUNCTION] = u"Прочий слой"
 
 
 def _describe_layer_function(layer_function):
@@ -2467,10 +2316,6 @@ def _breakup_wall(wall, show_alert=True):
 
 
 def main():
-    if not REVIT_ENV_READY:
-        _handle_missing_environment()
-        return
-
     _LAYER_JOIN_CACHE.clear()
     _PENDING_LAYER_JOINS.clear()
 
@@ -2503,8 +2348,5 @@ def main():
 
 
 if __name__ == '__main__':
-    if not REVIT_ENV_READY:
-        _handle_missing_environment()
-    else:
-        main()
+    main()
 
