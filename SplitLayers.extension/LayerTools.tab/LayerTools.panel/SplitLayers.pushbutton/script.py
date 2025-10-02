@@ -4,8 +4,6 @@
 __title__ = 'Разбить\nСтену'
 __author__ = 'Wall Layers Separator'
 
-from __future__ import annotations
-
 import sys
 from typing import TYPE_CHECKING
 
