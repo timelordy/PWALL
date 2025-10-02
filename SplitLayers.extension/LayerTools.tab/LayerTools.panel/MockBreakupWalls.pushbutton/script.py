@@ -23,10 +23,6 @@ from Autodesk.Revit.DB import (
     BuiltInParameter,
     CompoundStructure,
     CompoundStructureLayer,
-    FailureHandlingOptions,
-    FailureProcessingResult,
-    FailureSeverity,
-    IFailuresPreprocessor,
     ElementId,
     FamilyInstance,
     FilteredElementCollector,
@@ -43,16 +39,13 @@ from Autodesk.Revit.DB import (
     WallLocationLine,
     WallType,
     WallUtils,
-    Line,
     XYZ,
     JoinGeometryUtils,
-    ElementTransformUtils,
     InstanceVoidCutUtils,
     GeometryInstance,
     Options,
     Solid,
     ViewDetailLevel,
-    BuiltInFailures,
 )
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType
@@ -71,37 +64,12 @@ _SIGNATURE_CACHE = {}
 _LAYER_JOIN_CACHE = {}
 _PENDING_LAYER_JOINS = defaultdict(list)
 _OPENING_MARGIN = 0.0
-_OFFSET_TOLERANCE = 1e-4
-try:
-    _STAGING_DISTANCE = UnitUtils.ConvertToInternalUnits(12000.0, UnitTypeId.Millimeters)
-except Exception:
-    _STAGING_DISTANCE = 12000.0 / 304.8  # ~12 м в футах
-
-try:
-    _REVIT_MIN_DIMENSION = UnitUtils.ConvertToInternalUnits(1.0 / 32.0, UnitTypeId.Feet)
-except Exception:
-    _REVIT_MIN_DIMENSION = 1.0 / 32.0
 
 _CAN_ADD_VOID_CUT = getattr(InstanceVoidCutUtils, 'CanAddInstanceVoidCut', None)
 _ADD_INSTANCE_VOID_CUT = getattr(InstanceVoidCutUtils, 'AddInstanceVoidCut', None)
 _APPLY_WALL_JOIN_TYPE = getattr(WallUtils, 'ApplyJoinType', None)
 _ALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'AllowWallJoinAtEnd', None)
 _DISALLOW_WALL_JOIN_AT_END = getattr(WallUtils, 'DisallowWallJoinAtEnd', None)
-
-_ATTACHMENT_PARAM_CANDIDATES = {
-    'base': ('WALL_BASE_IS_ATTACHED', 'WALL_BASE_IS_ATTACHED_PARAM'),
-    'top': ('WALL_TOP_IS_ATTACHED', 'WALL_TOP_IS_ATTACHED_PARAM'),
-}
-_WALL_ATTACHMENT_PARAMS = {}
-for _attach_key, _name_candidates in _ATTACHMENT_PARAM_CANDIDATES.items():
-    for _param_name in _name_candidates:
-        try:
-            _param_value = getattr(BuiltInParameter, _param_name)
-        except Exception:
-            _param_value = None
-        if _param_value is not None:
-            _WALL_ATTACHMENT_PARAMS[_attach_key] = _param_value
-            break
 
 try:
     from Autodesk.Revit.DB import WallJoinType  # type: ignore
@@ -152,101 +120,6 @@ def _describe_layer_function(layer_function):
         return _to_unicode(layer_function)
 
 
-class _SuppressOverlappingWallsPreprocessor(IFailuresPreprocessor):
-    """Автоматически скрывает предупреждения о перекрывающихся стенах."""
-
-    _KEYWORDS = (u"перекры", u"overlap")
-
-    def __init__(self):
-        overlap_ids = []
-        try:
-            wall_failures = getattr(BuiltInFailures, 'WallFailures', None)
-        except Exception:
-            wall_failures = None
-        candidate_names = (
-            'WallOverlap',
-            'WallOverlaps',
-            'WallFacesOverlap',
-        )
-        for name in candidate_names:
-            try:
-                failure_id = getattr(wall_failures, name)
-            except Exception:
-                failure_id = None
-            if failure_id:
-                overlap_ids.append(failure_id)
-        self._overlap_ids = tuple(overlap_ids)
-
-    def _is_overlap_failure(self, failure_message):
-        try:
-            failure_id = failure_message.GetFailureDefinitionId()
-        except Exception:
-            failure_id = None
-        for target in self._overlap_ids:
-            try:
-                if failure_id == target:
-                    return True
-            except Exception:
-                continue
-
-        try:
-            text = failure_message.GetDescriptionText()
-        except Exception:
-            text = u""
-        if not text:
-            return False
-        lowered = text.lower()
-        return any(keyword in lowered for keyword in self._KEYWORDS)
-
-    def PreprocessFailures(self, failures_accessor):  # noqa: N802 (Revit API стиль)
-        if failures_accessor is None:
-            return FailureProcessingResult.Continue
-
-        try:
-            failure_messages = list(failures_accessor.GetFailureMessages())
-        except Exception:
-            failure_messages = []
-
-        for failure in failure_messages:
-            try:
-                severity = failure.GetSeverity()
-            except Exception:
-                severity = None
-
-            if severity != FailureSeverity.Warning:
-                continue
-
-            if not self._is_overlap_failure(failure):
-                continue
-
-            try:
-                failures_accessor.DeleteWarning(failure)
-            except Exception:
-                continue
-
-        return FailureProcessingResult.Continue
-
-
-_SUPPRESS_OVERLAP_FAILURES = _SuppressOverlappingWallsPreprocessor()
-
-
-def _configure_transaction_failures(transaction):
-    if transaction is None:
-        return
-
-    try:
-        options = transaction.GetFailureHandlingOptions()
-    except Exception:
-        return
-
-    try:
-        options.SetFailuresPreprocessor(_SUPPRESS_OVERLAP_FAILURES)
-        options.SetClearAfterRollback(True)
-        transaction.SetFailureHandlingOptions(options)
-    except Exception:
-        return
-
-
 def _get_param_double(element, param_id):
     if element is None:
         return None
@@ -268,136 +141,6 @@ def _get_param_double(element, param_id):
             return float(param.AsValueString())
         except Exception:
             return None
-
-
-def _get_param_bool(element, param_id):
-    if element is None or param_id is None:
-        return False
-    try:
-        param = element.get_Parameter(param_id)
-    except Exception:
-        param = None
-    if param is None:
-        return False
-    try:
-        if hasattr(param, 'HasValue') and not param.HasValue:
-            return False
-    except Exception:
-        pass
-    try:
-        return bool(param.AsInteger())
-    except Exception:
-        pass
-    try:
-        return bool(param.AsDouble())
-    except Exception:
-        pass
-    try:
-        text = param.AsValueString()
-    except Exception:
-        text = None
-    if text:
-        lowered = text.strip().lower()
-        if lowered in ('1', 'true', 'yes', 'да', 'истина'):
-            return True
-    return False
-
-
-def _set_param_bool(element, param_id, state):
-    if element is None or param_id is None:
-        return False
-    try:
-        param = element.get_Parameter(param_id)
-    except Exception:
-        param = None
-    if param is None:
-        return False
-    if getattr(param, 'IsReadOnly', True):
-        return False
-    try:
-        param.Set(1 if state else 0)
-        return True
-    except Exception:
-        pass
-    try:
-        param.Set(bool(state))
-        return True
-    except Exception:
-        return False
-
-
-def _try_detach_wall_end(wall, detach_top):
-    if wall is None:
-        return False
-
-    detached = False
-    method_names = ('DetachTop', 'DetachTopAndLockHeight') if detach_top else ('DetachBottom', 'DetachBase')
-    for name in method_names:
-        method = getattr(wall, name, None)
-        if not callable(method):
-            continue
-        for args in ((), (doc,),):
-            try:
-                method(*args)
-                detached = True
-                break
-            except TypeError:
-                continue
-            except Exception:
-                break
-        if detached:
-            break
-
-    if detached:
-        return True
-
-    detach_utils = getattr(WallUtils, 'DetachWall', None)
-    if callable(detach_utils):
-        candidates = [
-            (doc, wall),
-            (doc, wall.Id),
-            (doc, wall, detach_top),
-            (doc, wall.Id, detach_top),
-        ]
-        for args in candidates:
-            try:
-                detach_utils(*args)
-                detached = True
-                break
-            except TypeError:
-                continue
-            except Exception:
-                break
-
-    return detached
-
-
-def _reset_wall_attachment_flags(wall, context=None):
-    if wall is None:
-        return False
-
-    changed = False
-    if context is None:
-        context = {}
-
-    for key in ('base', 'top'):
-        param_id = _WALL_ATTACHMENT_PARAMS.get(key)
-        if param_id is None:
-            continue
-
-        state_key = '{}_attached'.format(key)
-        should_detach = context.get(state_key)
-        if should_detach is False:
-            continue
-
-        if should_detach:
-            if _try_detach_wall_end(wall, detach_top=(key == 'top')):
-                changed = True
-
-        if _set_param_bool(wall, param_id, False):
-            changed = True
-
-    return changed
 
 
 def _get_instance_clear_width(instance):
@@ -615,79 +358,15 @@ def _layer_signature_for_join(layer_info):
     return (material_key, width, function)
 
 
-def _get_layer_offset(layer):
-    if not isinstance(layer, dict):
-        return None
-    offset = layer.get('offset')
-    if offset is None:
-        start = layer.get('start')
-        end = layer.get('end')
-        if start is None or end is None:
-            return None
-        try:
-            offset = (float(start) + float(end)) / 2.0
-        except Exception:
-            return None
-        reference_offset = layer.get('reference_offset')
-        if reference_offset is not None:
-            try:
-                offset -= float(reference_offset)
-            except Exception:
-                pass
-    try:
-        return float(offset)
-    except Exception:
-        return None
-
-
-def _offset_difference(layer_a, layer_b):
-    offset_a = _get_layer_offset(layer_a)
-    offset_b = _get_layer_offset(layer_b)
-    if offset_a is None or offset_b is None:
-        return None
-    try:
-        return abs(offset_a - offset_b)
-    except Exception:
-        return None
-
-
-def _offsets_compatible(layer_a, layer_b, tolerance=_OFFSET_TOLERANCE):
-    diff = _offset_difference(layer_a, layer_b)
-    if diff is None:
-        return True
-    return diff <= tolerance
-
-
 def _match_layer_by_signature(target_layer, candidates, used_ids):
     target_signature = _layer_signature_for_join(target_layer)
-    target_offset = _get_layer_offset(target_layer)
-    best_candidate = None
-    best_diff = None
-
     for candidate in candidates:
         candidate_id = _element_id_to_int(candidate.get('wall_id'))
         if candidate_id in used_ids:
             continue
-        if _layer_signature_for_join(candidate) != target_signature:
-            continue
-
-        if target_offset is None:
+        if _layer_signature_for_join(candidate) == target_signature:
             return candidate
-
-        diff = _offset_difference(target_layer, candidate)
-        if diff is not None and diff <= _OFFSET_TOLERANCE:
-            return candidate
-
-        if diff is None:
-            if best_candidate is None:
-                best_candidate = candidate
-            continue
-
-        if best_diff is None or diff < best_diff:
-            best_candidate = candidate
-            best_diff = diff
-
-    return best_candidate
+    return None
 
 
 def _normalize_join_meta(meta):
@@ -759,14 +438,7 @@ def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_
     if not layers:
         return None
 
-    layer_data, total_width, core_start, core_end = _structure_layers_data(structure)
-    try:
-        context = _build_wall_context(wall, structure, total_width, core_start, core_end)
-    except Exception:
-        context = {}
-    reference_offset = context.get('reference_offset')
-    if reference_offset is None:
-        reference_offset = total_width / 2.0 if total_width is not None else None
+    layer_data, _, _, _ = _structure_layers_data(structure)
     filtered_layers = []
     for info in layer_data:
         width = info.get('width', 0.0) or 0.0
@@ -776,28 +448,12 @@ def _build_join_entry_from_existing_wall(wall, expected_signatures=None, target_
             signature = _layer_signature_for_join(info)
             if signature not in expected_signatures:
                 continue
-        start = info.get('start')
-        end = info.get('end')
-        center = None
-        if start is not None and end is not None:
-            try:
-                center = (float(start) + float(end)) / 2.0
-            except Exception:
-                center = None
-        offset = None
-        if center is not None and reference_offset is not None:
-            try:
-                offset = center - float(reference_offset)
-            except Exception:
-                offset = None
         filtered_layers.append({
             'index': info.get('index'),
             'function': info.get('function'),
             'width': width,
             'material_id': info.get('material_id'),
             'wall_id': wall.Id,
-            'offset': offset,
-            'reference_offset': reference_offset,
         })
 
     if not filtered_layers:
@@ -849,41 +505,6 @@ def _suppress_auto_join(wall):
         except Exception:
             continue
     return success
-
-
-def _set_room_bounding(wall, enabled):
-    if wall is None:
-        return False
-
-    value = 1 if enabled else 0
-    result = False
-    param_names = (
-        'WALL_ATTR_ROOM_BOUNDING',
-        'ROOM_BOUNDING',
-    )
-
-    for param_name in param_names:
-        param_id = getattr(BuiltInParameter, param_name, None)
-        if param_id is None:
-            continue
-        try:
-            param = wall.get_Parameter(param_id)
-        except Exception:
-            param = None
-        if param is None:
-            continue
-        try:
-            if getattr(param, 'IsReadOnly', False):
-                continue
-        except Exception:
-            pass
-        try:
-            param.Set(value)
-            result = True
-        except Exception:
-            continue
-
-    return result
 
 
 def _unjoin_two_walls(first_wall, second_wall):
@@ -1016,12 +637,6 @@ def _attempt_layer_joins(entry_a, entry_b, join_meta=None):
         layer_b = layers_b_by_index.get(layer_a.get('index'))
         if layer_b is None or _element_id_to_int(layer_b.get('wall_id')) in used_b:
             layer_b = _match_layer_by_signature(layer_a, layers_b, used_b)
-        elif not _offsets_compatible(layer_a, layer_b):
-            temp_used = set(used_b)
-            candidate_id = _element_id_to_int(layer_b.get('wall_id'))
-            if candidate_id is not None:
-                temp_used.add(candidate_id)
-            layer_b = _match_layer_by_signature(layer_a, layers_b, temp_used)
         if layer_b is None:
             continue
 
@@ -1141,50 +756,6 @@ def _normalize_join_info(join_info):
     }
 
 
-def _layer_has_join_target(layer_info, joined_infos):
-    if not layer_info or not joined_infos:
-        return False
-
-    try:
-        layer_index = layer_info.get('index')
-    except Exception:
-        layer_index = None
-
-    try:
-        signature = _layer_signature_for_join(layer_info)
-    except Exception:
-        signature = None
-
-    for raw_info in joined_infos:
-        info = _normalize_join_info(raw_info)
-        entry = info.get('entry') if isinstance(info, dict) else None
-        if not entry:
-            # Нет подробностей о слоях, но стена существует — считаем, что
-            # соединение нужно.
-            return True
-
-        layers = entry.get('layers') or []
-        if not layers:
-            return True
-
-        for neighbour_layer in layers:
-            if layer_index is not None and neighbour_layer.get('index') == layer_index:
-                return True
-
-            if signature is None:
-                continue
-
-            try:
-                neighbour_signature = _layer_signature_for_join(neighbour_layer)
-            except Exception:
-                neighbour_signature = None
-
-            if neighbour_signature == signature:
-                return True
-
-    return False
-
-
 def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_wall_ids):
     if not produced_layers:
         return
@@ -1195,20 +766,12 @@ def _handle_layer_joins(original_wall_id, wall_type_id, produced_layers, joined_
         wall = record.get('wall')
         if wall is None:
             continue
-        offset = record.get('offset')
-        if offset is None:
-            offset = info.get('offset')
-        reference_offset = record.get('reference_offset')
-        if reference_offset is None:
-            reference_offset = info.get('reference_offset')
         layer_records.append({
             'index': info.get('index'),
             'function': info.get('function'),
             'width': info.get('width', 0.0),
             'material_id': info.get('material_id'),
             'wall_id': wall.Id,
-            'offset': offset,
-            'reference_offset': reference_offset,
         })
 
     if not layer_records:
@@ -1251,23 +814,15 @@ class _LayerChoice(object):
     def __init__(self, layer_info):
         self.layer_info = layer_info
         function_name = _describe_layer_function(layer_info.get('function'))
-        material_name = _to_unicode(layer_info.get('material_name') or u'')
         width_mm = _feet_to_mm(layer_info.get('width', 0.0))
         try:
             width_text = u"{:.1f}".format(width_mm)
         except Exception:
             width_text = _to_unicode(width_mm)
-        details = []
-        if material_name:
-            details.append(u"Материал: {}".format(material_name))
-        details.append(u"{} мм".format(width_text))
-        detail_text = u", ".join(details)
-        core_suffix = u" (ядро)" if layer_info.get('is_core') else u""
-        self.name = u"Слой {index}{core}: {function} — {details}".format(
+        self.name = u"Слой {index}: {function} ({width} мм)".format(
             index=layer_info.get('index'),
-            core=core_suffix,
             function=function_name,
-            details=detail_text,
+            width=width_text,
         )
 
 
@@ -1283,21 +838,13 @@ _LAYER_SELECTION_XAML = u"""
         Topmost="True"
         AllowsTransparency="False">
     <DockPanel Margin="12">
-        <StackPanel Orientation="Horizontal"
-                    DockPanel.Dock="Bottom"
-                    HorizontalAlignment="Right"
-                    Margin="0,12,0,0">
-            <Button x:Name="DefaultLayerButton"
-                    Content="К первому слою"
-                    Width="140"
-                    Height="28"
-                    Margin="0,0,8,0"
-                    IsDefault="True"/>
-            <Button x:Name="OkButton"
-                    Content="Выбрать"
-                    Width="110"
-                    Height="28"/>
-        </StackPanel>
+        <Button x:Name="OkButton"
+                Content="Выбрать"
+                DockPanel.Dock="Bottom"
+                Width="110"
+                Height="28"
+                HorizontalAlignment="Right"
+                Margin="0,12,0,0"/>
         <ListBox x:Name="LayerList"
                  DisplayMemberPath="name"
                  HorizontalContentAlignment="Stretch"
@@ -1315,15 +862,12 @@ class _LayerSelectionDialog(object):
         self._window.WindowStartupLocation = WindowStartupLocation.Manual
         self._listbox = self._window.FindName('LayerList')
         self._ok_button = self._window.FindName('OkButton')
-        self._default_button = self._window.FindName('DefaultLayerButton')
         self._listbox.ItemsSource = self._choices
         if default_choice in self._choices:
             self._listbox.SelectedItem = default_choice
         elif self._choices:
             self._listbox.SelectedIndex = 0
         self._ok_button.Click += self._on_accept
-        if self._default_button is not None:
-            self._default_button.Click += self._on_choose_first_layer
         self._window.KeyDown += self._on_key_down
         self._listbox.MouseDoubleClick += self._on_double_click
         self._result = None
@@ -1344,10 +888,7 @@ class _LayerSelectionDialog(object):
         except Exception:
             key = None
         if key == Key.Enter:
-            if self._default_button is not None:
-                self._on_choose_first_layer(self._default_button, args)
-            else:
-                self._accept()
+            self._accept()
         elif key == Key.Escape:
             self._result = None
             self._window.Close()
@@ -1357,21 +898,6 @@ class _LayerSelectionDialog(object):
 
     def _on_accept(self, sender, args):
         self._accept()
-
-    def _on_choose_first_layer(self, sender, args):
-        if self._choices:
-            try:
-                self._result = self._choices[0]
-            except Exception:
-                self._result = None
-        else:
-            self._result = None
-        if args is not None:
-            try:
-                args.Handled = True
-            except Exception:
-                pass
-        self._window.Close()
 
     def _accept(self):
         try:
@@ -1535,29 +1061,6 @@ def _collect_structure(wall):
     return structure, layers
 
 
-def _get_material_name(material_id):
-    if material_id is None or not isinstance(material_id, ElementId):
-        return u''
-
-    try:
-        if material_id.IntegerValue < 1:
-            return u''
-    except Exception:
-        pass
-
-    try:
-        material = doc.GetElement(material_id)
-    except Exception:
-        material = None
-
-    name = _get_element_name(material)
-    if name:
-        return name
-
-    try:
-        return u'ID {}'.format(material_id.IntegerValue)
-    except Exception:
-        return u''
 
 
 
@@ -1708,7 +1211,6 @@ def _collect_target_walls():
 
 def _structure_layers_data(structure):
     layer_items = _layers_to_sequence(structure.GetLayers())
-    layer_count = len(layer_items)
     first_core = getattr(structure, 'GetFirstCoreLayerIndex', lambda: -1)()
     last_core = getattr(structure, 'GetLastCoreLayerIndex', lambda: -1)()
 
@@ -1735,8 +1237,6 @@ def _structure_layers_data(structure):
                 material_id = candidate
                 break
 
-        material_name = _get_material_name(material_id)
-
         if (
             (material_id is None)
             or (not isinstance(material_id, ElementId))
@@ -1753,7 +1253,6 @@ def _structure_layers_data(structure):
                 and candidate.IntegerValue > 0
             ):
                 material_id = candidate
-                material_name = _get_material_name(material_id)
 
         try:
             function = layer.Function
@@ -1774,11 +1273,8 @@ def _structure_layers_data(structure):
             'start': start,
             'end': end,
             'material_id': material_id,
-            'material_name': material_name,
             'function': function,
             'is_core': is_core,
-            'is_first': idx == 0,
-            'is_last': idx == (layer_count - 1),
         })
 
     total_width = position
@@ -1893,120 +1389,6 @@ def _scale_vector(vector, scale):
         return XYZ.Zero
 
 
-def _is_zero_vector(vector, tolerance=1e-9):
-    if vector is None:
-        return True
-    try:
-        if vector.IsZeroLength():
-            return True
-    except Exception:
-        pass
-    try:
-        x = float(getattr(vector, 'X', 0.0))
-        y = float(getattr(vector, 'Y', 0.0))
-        z = float(getattr(vector, 'Z', 0.0))
-    except Exception:
-        return False
-    return abs(x) <= tolerance and abs(y) <= tolerance and abs(z) <= tolerance
-
-
-def _add_vectors(*vectors):
-    total_x = total_y = total_z = 0.0
-    has_value = False
-    for vector in vectors:
-        if vector is None:
-            continue
-        added = False
-        try:
-            total_x += float(getattr(vector, 'X', 0.0))
-            total_y += float(getattr(vector, 'Y', 0.0))
-            total_z += float(getattr(vector, 'Z', 0.0))
-            added = True
-        except Exception:
-            try:
-                total_x += getattr(vector, 'X', 0.0)
-                total_y += getattr(vector, 'Y', 0.0)
-                total_z += getattr(vector, 'Z', 0.0)
-                added = True
-            except Exception:
-                added = False
-        if added:
-            has_value = True
-    if not has_value:
-        return XYZ.Zero
-    return XYZ(total_x, total_y, total_z)
-
-
-def _plan_staging_vector(inward_vector):
-    if _STAGING_DISTANCE <= _WIDTH_EPS:
-        return XYZ.Zero
-    candidate = _scale_vector(inward_vector, _STAGING_DISTANCE)
-    if _is_zero_vector(candidate):
-        return XYZ.Zero
-    return candidate
-
-
-def _shrink_curve(curve, shrink_distance, min_length=1e-6):
-    """Возвращает копию кривой, укороченной на указанную величину."""
-
-    if curve is None:
-        return None
-
-    try:
-        shrink = abs(float(shrink_distance or 0.0))
-    except Exception:
-        shrink = 0.0
-
-    if shrink <= min_length:
-        return curve
-
-    try:
-        length = float(curve.Length)
-    except Exception:
-        try:
-            length = float(curve.ApproximateLength)
-        except Exception:
-            length = None
-
-    if length is None or length <= min_length:
-        return curve
-
-    max_shrink = max(0.0, length - min_length)
-    if max_shrink <= min_length:
-        return curve
-
-    shrink = min(shrink, max_shrink)
-    half_shrink = shrink / 2.0
-
-    try:
-        start_param = curve.GetEndParameter(0)
-        end_param = curve.GetEndParameter(1)
-        param_range = end_param - start_param
-        if param_range > 0:
-            param_delta = (half_shrink / length) * param_range
-            new_start = start_param + param_delta
-            new_end = end_param - param_delta
-            if new_end > new_start:
-                trimmed = curve.CreateTrimmedCurve(new_start, new_end)
-                if trimmed:
-                    return trimmed
-    except Exception:
-        pass
-
-    try:
-        start = curve.GetEndPoint(0)
-        end = curve.GetEndPoint(1)
-        direction = end - start
-        if direction.IsZeroLength():
-            return curve
-        direction = direction.Normalize()
-        new_start = start + direction.Multiply(half_shrink)
-        new_end = end - direction.Multiply(half_shrink)
-        return Line.CreateBound(new_start, new_end)
-    except Exception:
-        return curve
-
-
 def _make_signature(layer_info):
     material_id = layer_info['material_id']
     material_value = material_id.IntegerValue if material_id and material_id.IntegerValue > 0 else -1
@@ -2027,39 +1409,10 @@ def _make_signature(layer_info):
     return (round(layer_info['width'], 6), material_value, function_value)
 
 
-def _is_valid_element(element):
-    try:
-        return bool(element) and getattr(element, 'IsValidObject', False)
-    except Exception:
-        return False
-
-
-def _resolve_element(element_id):
-    if isinstance(element_id, int):
-        try:
-            element_id = ElementId(element_id)
-        except Exception:
-            return None
-
-    if not isinstance(element_id, ElementId):
-        return None
-    try:
-        if element_id is None or element_id == ElementId.InvalidElementId:
-            return None
-    except Exception:
-        return None
-    try:
-        return doc.GetElement(element_id)
-    except Exception:
-        return None
-
-
 def _find_existing_single_layer_type(signature):
     cached = _SIGNATURE_CACHE.get(signature)
-    if cached and _is_valid_element(cached):
+    if cached:
         return cached
-    elif cached:
-        _SIGNATURE_CACHE.pop(signature, None)
 
     width, material_value, function_value = signature
 
@@ -2131,12 +1484,6 @@ def _clone_wall_type_for_layer(source_type, layer_info):
     width = layer_info['width']
     width_mm = _feet_to_mm(width)
 
-    if not _is_valid_element(source_type):
-        source_type = _resolve_element(layer_info.get('source_type_id'))
-
-    if not _is_valid_element(source_type):
-        return None
-
     base_name = _get_element_name(source_type)
     if not base_name:
         base_name = u"Слой стены"
@@ -2146,80 +1493,38 @@ def _clone_wall_type_for_layer(source_type, layer_info):
     if not name:
         name = u"Layer_{}".format(layer_info['index'])
 
-    started_transaction = False
-    transaction = None
-    try:
-        if not getattr(doc, 'IsModifiable', False):
-            transaction = Transaction(doc, 'Подготовка типа слоя стены')
-            transaction.Start()
-            started_transaction = True
-    except Exception:
-        transaction = None
-
-    try:
-        suffix = 1
-        while True:
-            try:
-                new_type = source_type.Duplicate(name)
-                break
-            except Exception as exc:
-                suffix += 1
-                name = _sanitize_name(u"{} #{}".format(base_label, suffix))
-                if suffix > 50:
-                    logger.warning(
-                        'Не удалось дублировать тип для слоя %s: %s',
-                        layer_info['index'],
-                        exc,
-                    )
-                    if started_transaction and transaction:
-                        transaction.RollBack()
-                    return None
-
-        material_id = (
-            layer_info['material_id']
-            if layer_info['material_id']
-            else ElementId.InvalidElementId
-        )
-        function = layer_info.get('function') or MaterialFunctionAssignment.Finish1
-
+    suffix = 1
+    while True:
         try:
-            new_layer = CompoundStructureLayer(width, function, material_id)
-            if hasattr(new_layer, 'IsCore'):
-                try:
-                    new_layer.IsCore = layer_info.get('is_core', False)
-                except Exception:
-                    pass
-            layer_list = List[CompoundStructureLayer]()
-            layer_list.Add(new_layer)
-            comp = CompoundStructure.CreateSimpleCompoundStructure(layer_list)
-            new_type.SetCompoundStructure(comp)
-        except Exception as exc:
-            logger.warning('Не удалось пересобрать структуру типу "%s": %s', name, exc)
-            if started_transaction and transaction:
-                transaction.RollBack()
-            return None
-
-        if started_transaction and transaction:
-            try:
-                transaction.Commit()
-            except Exception as exc:
-                logger.warning('Не удалось зафиксировать создание типа слоя %s: %s', layer_info['index'], exc)
-                try:
-                    transaction.RollBack()
-                except Exception:
-                    pass
+            new_type = source_type.Duplicate(name)
+            break
+        except Exception:
+            suffix += 1
+            name = _sanitize_name(u"{} #{}".format(base_label, suffix))
+            if suffix > 50:
+                logger.warning('Не удалось дублировать тип для слоя %s', layer_info['index'])
                 return None
 
-        if _is_valid_element(new_type):
-            _SIGNATURE_CACHE[signature] = new_type
-        return new_type
-    except Exception:
-        if started_transaction and transaction:
+    material_id = layer_info['material_id'] if layer_info['material_id'] else ElementId.InvalidElementId
+    function = layer_info.get('function') or MaterialFunctionAssignment.Finish1
+
+    try:
+        new_layer = CompoundStructureLayer(width, function, material_id)
+        if hasattr(new_layer, 'IsCore'):
             try:
-                transaction.RollBack()
+                new_layer.IsCore = layer_info.get('is_core', False)
             except Exception:
                 pass
-        raise
+        layer_list = List[CompoundStructureLayer]()
+        layer_list.Add(new_layer)
+        comp = CompoundStructure.CreateSimpleCompoundStructure(layer_list)
+        new_type.SetCompoundStructure(comp)
+    except Exception as exc:
+        logger.warning('Не удалось пересобрать структуру типу "%s": %s', name, exc)
+        return None
+
+    _SIGNATURE_CACHE[signature] = new_type
+    return new_type
 
 
 def _apply_vertical_constraints(wall, context):
@@ -2245,49 +1550,6 @@ def _apply_vertical_constraints(wall, context):
         pass
 
 
-def _compute_wall_height_from_geometry(wall, curve=None):
-    heights = []
-
-    try:
-        bbox = wall.get_BoundingBox(None)
-    except Exception:
-        bbox = None
-
-    if bbox is not None:
-        transform = getattr(bbox, 'Transform', None)
-        min_pt = bbox.Min
-        max_pt = bbox.Max
-        if transform is not None:
-            try:
-                min_pt = transform.OfPoint(min_pt)
-                max_pt = transform.OfPoint(max_pt)
-            except Exception:
-                pass
-        if min_pt is not None and max_pt is not None:
-            try:
-                heights.append(abs(max_pt.Z - min_pt.Z))
-            except Exception:
-                pass
-
-    if curve is None:
-        location = getattr(wall, 'Location', None)
-        if isinstance(location, LocationCurve):
-            curve = location.Curve
-
-    if curve is not None:
-        try:
-            start_z = curve.GetEndPoint(0).Z
-            end_z = curve.GetEndPoint(1).Z
-            heights.append(abs(end_z - start_z))
-        except Exception:
-            pass
-
-    valid_heights = [h for h in heights if h is not None and h > 0]
-    if valid_heights:
-        return max(valid_heights)
-    return None
-
-
 def _build_wall_context(wall, structure, total_width, core_start, core_end):
     location = getattr(wall, 'Location', None)
     if not isinstance(location, LocationCurve):
@@ -2303,44 +1565,7 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
 
     base_offset = wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET) else 0.0
     top_offset = wall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET) else 0.0
-
-    height = None
-    height_param = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM)
-    if height_param is not None:
-        has_value = True
-        try:
-            has_value = height_param.HasValue
-        except Exception:
-            pass
-        if has_value:
-            try:
-                candidate_height = height_param.AsDouble()
-            except Exception:
-                candidate_height = None
-            if candidate_height is not None and candidate_height > 0:
-                height = candidate_height
-
-    if height is None or height <= 0:
-        geometry_height = _compute_wall_height_from_geometry(wall, curve)
-        if geometry_height is not None and geometry_height > 0:
-            height = geometry_height
-
-    if height is None or height <= 0:
-        logger.warning(
-            u'Высота стены %s недоступна или неположительна (%.4f). '
-            u'Используем минимальное допустимое значение Revit.',
-            wall.Id,
-            height or 0.0,
-        )
-        height = _REVIT_MIN_DIMENSION
-    elif height < _REVIT_MIN_DIMENSION:
-        logger.warning(
-            u'Высота стены %s (%.4f) меньше минимально допустимой. '
-            u'Используем минимальное значение Revit.',
-            wall.Id,
-            height,
-        )
-        height = _REVIT_MIN_DIMENSION
+    height = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble() if wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM) else total_width
 
     flip = getattr(wall, 'Flipped', False)
     structural = getattr(wall, 'Structural', False)
@@ -2360,9 +1585,6 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
 
     reference_offset = _reference_offset(location_line, total_width, core_start, core_end)
 
-    base_attached = _get_param_bool(wall, _WALL_ATTACHMENT_PARAMS.get('base'))
-    top_attached = _get_param_bool(wall, _WALL_ATTACHMENT_PARAMS.get('top'))
-
     return {
         'curve': curve,
         'base_level_id': base_level_id if base_level_id and base_level_id.IntegerValue > 0 else wall.LevelId,
@@ -2375,8 +1597,6 @@ def _build_wall_context(wall, structure, total_width, core_start, core_end):
         'location_line': location_line,
         'orientation': orientation,
         'reference_offset': reference_offset,
-        'base_attached': base_attached,
-        'top_attached': top_attached,
     }
 
 
@@ -2389,26 +1609,8 @@ def _ensure_orientation_vector(context, curve):
 
 def _collect_hosted_instances(wall):
     hosted = []
-    try:
-        dependent_ids = wall.GetDependentElements(ElementClassFilter(FamilyInstance))
-    except Exception as exc:
-        logger.debug(
-            'Не удалось получить зависимые семейства для стены %s: %s',
-            _element_id_to_int(getattr(wall, 'Id', None)),
-            exc,
-        )
-        dependent_ids = []
-
-    for inst_id in dependent_ids:
-        inst = doc.GetElement(inst_id)
-        if inst is None:
-            logger.warning(
-                'Зависимый элемент %s для стены %s не найден или был удалён.',
-                _element_id_to_int(inst_id),
-                _element_id_to_int(getattr(wall, 'Id', None)),
-            )
-            continue
-
+    fi_collector = FilteredElementCollector(doc).OfClass(FamilyInstance)
+    for inst in fi_collector:
         host = getattr(inst, 'Host', None)
         if host is None or host.Id != wall.Id:
             continue
@@ -2878,61 +2080,53 @@ def _rehost_instances(instances, new_host_wall, other_walls=None):
             pass
 
 
-def _fail_breakup(message, wall_id=None, show_alert=True, level='warning', status='error'):
-    if show_alert:
-        forms.alert(message)
-    else:
-        if level == 'error':
-            logger.error(message)
-        elif level == 'info':
-            logger.info(message)
-        else:
-            logger.warning(message)
-    return {
-        'status': status,
-        'created': 0,
-        'message': message,
-        'wall_id': wall_id,
-    }
+def _breakup_wall(wall, show_alert=True):
+    wall_id = None
+    try:
+        wall_id = wall.Id.IntegerValue
+    except Exception:
+        pass
 
-
-def _prepare_wall_job(wall, show_alert=True):
-    wall_id = _element_id_to_int(getattr(wall, 'Id', None))
-
+    wall_type_id = None
     try:
         wall_type_id = _element_id_to_int(wall.WallType.Id)
     except Exception:
         wall_type_id = None
 
+    joined_wall_ids = []
+
+    def _handle_failure(message, level='warning', status='error'):
+        if show_alert:
+            forms.alert(message)
+        else:
+            if level == 'error':
+                logger.error(message)
+            elif level == 'info':
+                logger.info(message)
+            else:
+                logger.warning(message)
+        return {
+            'status': status,
+            'created': 0,
+            'message': message,
+            'wall_id': wall_id,
+        }
+
     structure, layers = _collect_structure(wall)
     if not layers:
-        return None, _fail_breakup(
-            'Для стены {} не найдены слои составной конструкции.'.format(wall_id),
-            wall_id,
-            show_alert=show_alert,
-        )
+        return _handle_failure('Для стены {} не найдены слои составной конструкции.'.format(wall_id))
 
     layer_data, total_width, core_start, core_end = _structure_layers_data(structure)
     layer_data = [item for item in layer_data if item['width'] > _WIDTH_EPS]
-    if layer_data:
-        last_index = len(layer_data) - 1
-        for idx, item in enumerate(layer_data):
-            item['is_first'] = idx == 0
-            item['is_last'] = idx == last_index
     if not layer_data:
-        return None, _fail_breakup(
-            'Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id),
-            wall_id,
-            show_alert=show_alert,
-        )
-
-    for item in layer_data:
-        item['source_type_id'] = wall_type_id
+        return _handle_failure('Для стены {} нет слоёв с ненулевой толщиной.'.format(wall_id))
 
     joined_wall_ids = _collect_joined_wall_ids(wall, wall_type_id, layer_data)
 
     hosted_instances = _collect_hosted_instances(wall)
+    host_layer_info = None
     selected_layer_index = None
+    preview_state = None
     if hosted_instances:
         try:
             uidoc.ShowElements(wall.Id)
@@ -2956,20 +2150,14 @@ def _prepare_wall_job(wall, show_alert=True):
         finally:
             _restore_view_detail(preview_state)
         if not host_layer_info:
-            return None, _fail_breakup(
-                'Операция отменена пользователем.',
-                wall_id,
-                show_alert=show_alert,
-                level='info',
-                status='cancelled',
-            )
+            return _handle_failure('Операция отменена пользователем.', level='info', status='cancelled')
 
         selected_layer_index = host_layer_info.get('index')
 
     try:
         context = _build_wall_context(wall, structure, total_width, core_start, core_end)
     except ValueError as exc:
-        return None, _fail_breakup(str(exc), wall_id, show_alert=show_alert)
+        return _handle_failure(str(exc))
 
     orientation = _ensure_orientation_vector(context, context['curve'])
     inward = _negate_vector(orientation)
@@ -2978,289 +2166,109 @@ def _prepare_wall_job(wall, show_alert=True):
     except Exception:
         pass
 
-    staging_vector = XYZ.Zero
-    staging_applied = False
-    if len(layer_data) > 1:
-        staging_vector = _plan_staging_vector(inward)
-        staging_applied = not _is_zero_vector(staging_vector)
-
-    join_expectations = {}
-    for info in layer_data:
-        index = info.get('index')
-        join_expectations[index] = _layer_has_join_target(info, joined_wall_ids)
-
-    job = {
-        'wall': wall,
-        'wall_id': wall_id,
-        'wall_type_id': wall_type_id,
-        'wall_type': getattr(wall, 'WallType', None),
-        'structure': structure,
-        'layer_data': layer_data,
-        'total_width': total_width,
-        'core_start': core_start,
-        'core_end': core_end,
-        'joined_wall_ids': joined_wall_ids,
-        'hosted_instances': hosted_instances,
-        'selected_layer_index': selected_layer_index,
-        'context': context,
-        'inward': inward,
-        'staging_vector': staging_vector,
-        'staging_applied': staging_applied,
-        'join_expectations': join_expectations,
-        'created_walls': [],
-        'produced_layers': [],
-        'show_alert': show_alert,
-        'status': 'pending',
-        'errors': [],
-        'prepared_join_controls': False,
-    }
-
-    return job, None
-
-
-def _create_wall_layer(job, layer_info):
-    if job is None or job.get('status') != 'pending':
-        return False
-
-    if layer_info.get('_created'):
-        return True
-
-    wall = job['wall']
-    context = job['context']
-    if not context:
-        return False
-
-    wall_type = job.get('wall_type')
-    if not _is_valid_element(wall_type):
-        wall_type = _resolve_element(job.get('wall_type_id'))
-        if wall_type is None:
-            logger.warning('Исходный тип стены для слоя %s недоступен', layer_info.get('index'))
-            return False
-        job['wall_type'] = wall_type
-
-    layer_info['source_type_id'] = getattr(wall_type, 'Id', None)
-
-    layer_type = _clone_wall_type_for_layer(wall_type, layer_info)
-    if layer_type is None:
-        return False
-
-    if not job['prepared_join_controls']:
-        try:
-            _ensure_join_controls(wall)
-        except Exception:
-            pass
-        try:
-            _suppress_auto_join(wall)
-        except Exception:
-            pass
-        job['prepared_join_controls'] = True
-
-    layer_center = (layer_info['start'] + layer_info['end']) / 2.0
-    offset_center = layer_center - context['reference_offset']
-    layer_info['offset'] = offset_center
-    layer_info['reference_offset'] = context['reference_offset']
-    translation_vector = _scale_vector(job.get('inward'), offset_center)
-    staging_vector = job.get('staging_vector') if job.get('staging_applied') else XYZ.Zero
-    total_translation = translation_vector
-    if not _is_zero_vector(staging_vector):
-        total_translation = _add_vectors(translation_vector, staging_vector)
-    layer_width = layer_info.get('width')
-
-    expects_join = bool(job['join_expectations'].get(layer_info.get('index')))
-    layer_info['expects_join'] = expects_join
-
-    shrink_distance = 0.0
-    if (
-        len(job['layer_data']) > 1
-        and layer_width is not None
-        and not layer_info.get('is_first')
-        and expects_join
-    ):
-        shrink_distance = layer_width
-
     base_curve = context['curve']
-    adjusted_curve = _shrink_curve(base_curve, shrink_distance) or base_curve
-    placement_curve = adjusted_curve.CreateTransformed(
-        Transform.CreateTranslation(total_translation)
-    )
+    base_level_id = context['base_level_id']
 
-    transaction_name = 'Создание слоя {} для стены {}'.format(
-        layer_info.get('index'), job.get('wall_id')
-    )
-    t = Transaction(doc, transaction_name)
-    _configure_transaction_failures(t)
+    created_walls = []
+    produced_layers = []
+    t = Transaction(doc, 'Разделение стены на слои')
     t.Start()
     try:
-        new_wall = Wall.Create(
-            doc,
-            placement_curve,
-            layer_type.Id,
-            context['base_level_id'],
-            context['height'],
-            context['base_offset'],
-            context['flip'],
-            context['structural'],
-        )
+        _ensure_join_controls(wall)
+        _suppress_auto_join(wall)
 
-        attachments_reset = _reset_wall_attachment_flags(new_wall, context)
-        _apply_vertical_constraints(new_wall, context)
+        for layer_info in layer_data:
+            layer_type = _clone_wall_type_for_layer(wall.WallType, layer_info)
+            if layer_type is None:
+                continue
 
-        try:
-            key_param = new_wall.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM)
-            if key_param:
-                key_param.Set(context['location_line'])
-        except Exception:
-            pass
+            layer_center = (layer_info['start'] + layer_info['end']) / 2.0
+            offset_center = layer_center - context['reference_offset']
+            translation_vector = _scale_vector(inward, offset_center)
+            placement_curve = base_curve.CreateTransformed(Transform.CreateTranslation(translation_vector))
 
-        existing_parts = list(job['created_walls'])
-        job['created_walls'].append(new_wall)
-        job['produced_layers'].append({
-            'wall': new_wall,
-            'info': dict(layer_info),
-            'offset': offset_center,
-            'reference_offset': context['reference_offset'],
-            'staging_applied': job.get('staging_applied', False),
-        })
-        logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
-
-        if attachments_reset and (context.get('base_attached') or context.get('top_attached')):
-            logger.debug(
-                'Сброшены привязки верха/низа для стены %s (слой %s)',
-                new_wall.Id.IntegerValue,
-                layer_info['index'],
-            )
-
-        _prepare_wall_for_manual_join(new_wall, existing_parts, wall)
-
-        layer_info['_created'] = True
-
-        t.Commit()
-        return True
-    except Exception as exc:
-        logger.warning('Не удалось создать стену для слоя %s: %s', layer_info.get('index'), exc)
-        t.RollBack()
-        job.setdefault('errors', []).append(str(exc))
-        return False
-
-
-def _finalize_wall_job(job, show_alert=None):
-    if job is None:
-        return None
-
-    wall = job['wall']
-    wall_id = job.get('wall_id')
-    if show_alert is None:
-        show_alert = job.get('show_alert', True)
-
-    created_walls = job.get('created_walls') or []
-    produced_layers = job.get('produced_layers') or []
-
-    if not created_walls:
-        job['status'] = 'failed'
-        return _fail_breakup(
-            'Для стены {} не удалось создать ни одной разделённой стены.'.format(wall_id),
-            wall_id,
-            show_alert=show_alert,
-        )
-
-    selected_layer_index = job.get('selected_layer_index')
-
-    host_wall = None
-    valid_layers = []
-    for record in produced_layers:
-        layer_info = record.get('info') or {}
-        wall_part = record.get('wall')
-        if not _is_valid_element(wall_part):
-            logger.debug(
-                'Стеновой элемент слоя %s недоступен и будет пропущен',
-                layer_info.get('index'),
-            )
-            continue
-        valid_layers.append(record)
-        if selected_layer_index is not None and layer_info.get('index') == selected_layer_index:
-            host_wall = wall_part
-            break
-
-    if host_wall is None:
-        for record in valid_layers:
-            layer_info = record.get('info') or {}
-            wall_part = record.get('wall')
-            if layer_info.get('function') == MaterialFunctionAssignment.Structure:
-                host_wall = wall_part
-                break
-
-    if not valid_layers:
-        job['status'] = 'failed'
-        return _fail_breakup(
-            'Не удалось создать ни одной валидной разделённой стены для {}.'.format(wall_id),
-            wall_id,
-            show_alert=show_alert,
-        )
-
-    if host_wall is None and valid_layers:
-        host_wall = valid_layers[0]['wall']
-
-    host_index = None
-    for idx, record in enumerate(valid_layers):
-        wall_part = record.get('wall')
-        if wall_part is not None and wall_part.Id == host_wall.Id:
-            host_index = idx
-            break
-
-    if host_index is None:
-        host_index = 0
-
-    preceding_walls = []
-    for idx, record in enumerate(valid_layers):
-        wall_part = record.get('wall')
-        if wall_part is None or wall_part.Id == host_wall.Id:
-            continue
-        if idx < host_index:
-            preceding_walls.append(wall_part)
-
-    transaction_name = 'Завершение разделения стены {}'.format(wall_id)
-    t = Transaction(doc, transaction_name)
-    _configure_transaction_failures(t)
-    t.Start()
-    try:
-        staging_vector = job.get('staging_vector') if job.get('staging_applied') else XYZ.Zero
-        if not _is_zero_vector(staging_vector):
-            move_vector = _negate_vector(staging_vector)
-            for record in valid_layers:
-                wall_part = record.get('wall')
-                if wall_part is None:
-                    continue
-                try:
-                    ElementTransformUtils.MoveElement(doc, wall_part.Id, move_vector)
-                except Exception as exc:
-                    layer_index = (record.get('info') or {}).get('index')
-                    logger.debug(
-                        'Не удалось временно переместить стену слоя %s обратно: %s',
-                        layer_index,
-                        exc,
-                    )
             try:
-                doc.Regenerate()
+                new_wall = Wall.Create(
+                    doc,
+                    placement_curve,
+                    layer_type.Id,
+                    base_level_id,
+                    context['height'],
+                    context['base_offset'],
+                    context['flip'],
+                    context['structural'],
+                )
+            except Exception as exc:
+                logger.warning('Не удалось создать стену для слоя %s: %s', layer_info['index'], exc)
+                continue
+
+            _apply_vertical_constraints(new_wall, context)
+
+            try:
+                key_param = new_wall.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM)
+                if key_param:
+                    key_param.Set(context['location_line'])
             except Exception:
                 pass
-            job['staging_applied'] = False
 
-        host_wall_id = getattr(getattr(host_wall, 'Id', None), 'IntegerValue', None)
-        for record in valid_layers:
+            existing_parts = list(created_walls)
+            created_walls.append(new_wall)
+            produced_layers.append({'wall': new_wall, 'info': dict(layer_info)})
+            logger.debug('Создана стена %s для слоя %s', new_wall.Id.IntegerValue, layer_info['index'])
+
+            _prepare_wall_for_manual_join(new_wall, existing_parts, wall)
+
+        if not created_walls:
+            t.RollBack()
+            return _handle_failure('Для стены {} не удалось создать ни одной разделённой стены.'.format(wall_id))
+
+        host_wall = None
+        for record in produced_layers:
+            layer_info = record.get('info') or {}
             wall_part = record.get('wall')
             if wall_part is None:
                 continue
-            wall_part_id = getattr(getattr(wall_part, 'Id', None), 'IntegerValue', None)
-            should_bound = host_wall_id is not None and wall_part_id == host_wall_id
-            _set_room_bounding(wall_part, should_bound)
+            if selected_layer_index is not None and layer_info.get('index') == selected_layer_index:
+                host_wall = wall_part
+                break
 
-        _rehost_instances(job.get('hosted_instances'), host_wall, preceding_walls)
+        if host_wall is None:
+            for record in produced_layers:
+                layer_info = record.get('info') or {}
+                wall_part = record.get('wall')
+                if wall_part is None:
+                    continue
+                if layer_info.get('function') == MaterialFunctionAssignment.Structure:
+                    host_wall = wall_part
+                    break
 
-        filtered_created = [wall_part for wall_part in created_walls if _is_valid_element(wall_part)]
-        for i in range(len(filtered_created)):
-            for j in range(i + 1, len(filtered_created)):
-                first_id = getattr(filtered_created[i], 'Id', None)
-                second_id = getattr(filtered_created[j], 'Id', None)
+        if host_wall is None:
+            host_wall = produced_layers[0]['wall']
+
+        host_index = None
+        for idx, record in enumerate(produced_layers):
+            wall_part = record.get('wall')
+            if wall_part is not None and wall_part.Id == host_wall.Id:
+                host_index = idx
+                break
+
+        if host_index is None:
+            host_index = 0
+
+        preceding_walls = []
+        for idx, record in enumerate(produced_layers):
+            wall_part = record.get('wall')
+            if wall_part is None or wall_part.Id == host_wall.Id:
+                continue
+            if idx < host_index:
+                preceding_walls.append(wall_part)
+
+        _rehost_instances(hosted_instances, host_wall, preceding_walls)
+
+        for i in range(len(created_walls)):
+            for j in range(i + 1, len(created_walls)):
+                first_id = getattr(created_walls[i], 'Id', None)
+                second_id = getattr(created_walls[j], 'Id', None)
                 if first_id is None or second_id is None:
                     continue
                 _join_two_walls(first_id, second_id)
@@ -3273,9 +2281,9 @@ def _finalize_wall_job(job, show_alert=None):
         try:
             _handle_layer_joins(
                 wall_id,
-                job.get('wall_type_id'),
-                valid_layers,
-                job.get('joined_wall_ids'),
+                wall_type_id,
+                produced_layers,
+                joined_wall_ids,
             )
         except Exception as exc:
             logger.debug('Не удалось обработать соединения слоев для стены %s: %s', wall_id, exc)
@@ -3285,24 +2293,14 @@ def _finalize_wall_job(job, show_alert=None):
         except Exception as exc:
             logger.warning('Не удалось удалить исходную стену %s: %s', wall_id, exc)
             t.RollBack()
-            return _fail_breakup(
-                'Не удалось удалить исходную стену {}.'.format(wall_id),
-                wall_id,
-                show_alert=show_alert,
-            )
+            return _handle_failure('Не удалось удалить исходную стену {}.'.format(wall_id))
 
         t.Commit()
     except Exception as exc:
-        logger.exception('Непредвиденная ошибка при завершении стены %s: %s', wall_id, exc)
+        logger.exception('Непредвиденная ошибка при разбиении стены %s: %s', wall_id, exc)
         t.RollBack()
-        return _fail_breakup(
-            'Непредвиденная ошибка при обработке стены {}.'.format(wall_id),
-            wall_id,
-            show_alert=show_alert,
-            level='error',
-        )
+        return _handle_failure('Непредвиденная ошибка при обработке стены {}.'.format(wall_id), level='error')
 
-    job['status'] = 'success'
     success_message = 'Создано {} стен-слоёв из стены {}.'.format(len(created_walls), wall_id)
     if show_alert:
         forms.alert(success_message)
@@ -3317,55 +2315,6 @@ def _finalize_wall_job(job, show_alert=None):
     }
 
 
-def _breakup_wall(wall, show_alert=True):
-    job, failure = _prepare_wall_job(wall, show_alert=show_alert)
-    if failure is not None:
-        return failure
-
-    for layer_info in job['layer_data']:
-        _create_wall_layer(job, layer_info)
-
-    return _finalize_wall_job(job, show_alert=show_alert)
-
-
-def _breakup_walls_layered(walls):
-    jobs = []
-    results = []
-
-    for wall in walls:
-        job, failure = _prepare_wall_job(wall, show_alert=False)
-        if failure is not None:
-            results.append(failure)
-            if failure.get('status') == 'cancelled':
-                return results
-            continue
-        jobs.append(job)
-
-    if not jobs:
-        return results
-
-    jobs.sort(key=lambda item: (-len(item['layer_data']), item.get('wall_id') or 0))
-    max_layers = max(len(job['layer_data']) for job in jobs)
-
-    for layer_index in range(1, max_layers + 1):
-        for job in jobs:
-            if job.get('status') != 'pending':
-                continue
-            if layer_index > len(job['layer_data']):
-                continue
-            layer_info = job['layer_data'][layer_index - 1]
-            _create_wall_layer(job, layer_info)
-
-    for job in jobs:
-        if job.get('status') != 'pending':
-            continue
-        result = _finalize_wall_job(job, show_alert=False)
-        if result is not None:
-            results.append(result)
-
-    return results
-
-
 def main():
     _LAYER_JOIN_CACHE.clear()
     _PENDING_LAYER_JOINS.clear()
@@ -3376,11 +2325,12 @@ def main():
         return
 
     multi_mode = len(walls) > 1
-
-    if multi_mode:
-        results = _breakup_walls_layered(walls)
-    else:
-        results = [_breakup_wall(walls[0], show_alert=True)]
+    results = []
+    for wall in walls:
+        result = _breakup_wall(wall, show_alert=not multi_mode)
+        results.append(result)
+        if result.get('status') == 'cancelled':
+            break
 
     if multi_mode:
         success_results = [item for item in results if item.get('status') == 'success']
